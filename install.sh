@@ -1,11 +1,29 @@
 #!/usr/bin/env bash
 # claudemanager installer
+#
+# Remote install (one-liner):
+#   curl -fsSL https://raw.githubusercontent.com/relipse/claudemanager/main/install.sh | bash
+#
+# Local install (after cloning):
+#   git clone https://github.com/relipse/claudemanager.git
+#   cd claudemanager && ./install.sh
+#
 # Installs claudemanager.sh and adds a shell wrapper function to your shell profile.
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL="https://raw.githubusercontent.com/relipse/claudemanager/main"
 INSTALL_DIR="${CLAUDE_BASE:-$HOME/util/claude}"
+
+# Detect if running locally (install.sh is next to claudemanager.sh)
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]] && [[ "${BASH_SOURCE[0]}" != "bash" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+LOCAL_MODE=false
+if [[ -n "$SCRIPT_DIR" ]] && [[ -f "$SCRIPT_DIR/claudemanager.sh" ]]; then
+    LOCAL_MODE=true
+fi
 
 # ── Colors ────────────────────────────────────────────────────────
 green=$'\e[32m'
@@ -57,9 +75,22 @@ main() {
     fi
     ok "Install directory: $INSTALL_DIR"
 
-    # 2. Copy script
+    # 2. Get claudemanager.sh (local copy or remote download)
     local target="$INSTALL_DIR/claudemanager.sh"
-    cp "$SCRIPT_DIR/claudemanager.sh" "$target"
+    if $LOCAL_MODE; then
+        info "Installing from local copy ..."
+        cp "$SCRIPT_DIR/claudemanager.sh" "$target"
+    else
+        info "Downloading claudemanager.sh ..."
+        if command -v curl &>/dev/null; then
+            curl -fsSL "$REPO_URL/claudemanager.sh" -o "$target"
+        elif command -v wget &>/dev/null; then
+            wget -qO "$target" "$REPO_URL/claudemanager.sh"
+        else
+            printf '%s[error]%s  curl or wget is required\n' "${yellow}${bold}" "${reset}"
+            exit 1
+        fi
+    fi
     chmod +x "$target"
     ok "Installed claudemanager.sh"
 

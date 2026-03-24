@@ -65,7 +65,7 @@ status_color="$green"
 search_query=""
 sort_mode="date"       # date | name | language
 view_mode="local"      # local | all
-compact_mode=true      # start compact, toggle with 'c'
+display_mode="compact"  # compact | full | grid
 
 # ── Cache arrays (parallel to dirs[]) ────────────────────────────
 declare -a dirs=()
@@ -537,9 +537,9 @@ draw() {
     # View + sort indicators
     local view_label="local"
     [[ "$view_mode" == "all" ]] && view_label="all projects"
-    local compact_label=""
-    $compact_mode && compact_label=" | compact"
-    tui '  %s[%s | sort:%s%s]%s' "${dim}${italic}" "$view_label" "$sort_mode" "$compact_label" "${reset}"
+    local mode_label=""
+    [[ "$display_mode" != "full" ]] && mode_label=" | $display_mode"
+    tui '  %s[%s | sort:%s%s]%s' "${dim}${italic}" "$view_label" "$sort_mode" "$mode_label" "${reset}"
 
     # Keybindings bar
     move_to 2 1
@@ -549,7 +549,7 @@ draw() {
     tui '%s n %s new  '         "${bg_green}${black}${bold}"    "${reset}${dim}"
     tui '%s p %s all  '         "${bg_cyan}${black}${bold}"     "${reset}${dim}"
     tui '%s t %s sort  '        "${bg_yellow}${black}${bold}"   "${reset}${dim}"
-    tui '%s c %s compact  '      "${bg_yellow}${black}${bold}"   "${reset}${dim}"
+    tui '%s c %s view  '          "${bg_yellow}${black}${bold}"   "${reset}${dim}"
     tui '%s a %s add  '         "${bg_magenta}${white}${bold}"  "${reset}${dim}"
     tui '%s R %s rename  '       "${bg_cyan}${black}${bold}"     "${reset}${dim}"
     tui '%s d %s del  '         "${bg_red}${white}${bold}"      "${reset}${dim}"
@@ -575,158 +575,242 @@ draw() {
 
     # ── List area ──
     local list_start=$(( header_end + 1 ))
-    local row_height=3
-    $compact_mode && row_height=1
-    local max_items=$(( (term_lines - list_start - 2) / row_height ))
-    (( max_items < 1 )) && max_items=1
 
-    if (( selected < scroll_offset )); then
-        scroll_offset=$selected
-    elif (( selected >= scroll_offset + max_items )); then
-        scroll_offset=$(( selected - max_items + 1 ))
-    fi
+    if [[ "$display_mode" == "grid" ]]; then
+        # ── GRID MODE ──
+        local cell_width=24
+        local cell_height=2
+        local grid_cols=$(( (term_cols - 2) / cell_width ))
+        (( grid_cols < 1 )) && grid_cols=1
+        local grid_rows=$(( (term_lines - list_start - 2) / cell_height ))
+        (( grid_rows < 1 )) && grid_rows=1
+        local max_items=$(( grid_cols * grid_rows ))
 
-    if (( ${#filtered[@]} == 0 )); then
-        move_to "$list_start" 4
-        if [[ -n "$search_query" ]]; then
-            tui '%sNo matches for "%s"%s' "${dim}${yellow}" "$search_query" "${reset}"
-        else
-            tui '%sNo projects found%s' "${dim}" "${reset}"
-        fi
-    fi
-
-    local i
-    for (( i = 0; i < max_items && i + scroll_offset < ${#filtered[@]}; i++ )); do
-        local fidx=$(( i + scroll_offset ))
-        local idx="${filtered[$fidx]}"
-        local title="${cache_title[$idx]}"
-        local base="${cache_base[$idx]}"
-        local date="${cache_date[$idx]}"
-        local rel_date="${cache_reldate[$idx]}"
-        local desc="${cache_desc[$idx]}"
-        local file_count="${cache_files[$idx]}"
-        local lang_name="${cache_lang[$idx]}"
-        local lang_color="${cache_langcolor[$idx]}"
-        local framework="${cache_framework[$idx]}"
-        local source="${cache_source[$idx]}"
-        local fullpath="${cache_fullpath[$idx]}"
-
-        local row=$(( list_start + i * row_height ))
-
-        # Source badge for non-local dirs
-        local source_badge=""
-        if [[ "$source" == "discovered" ]]; then
-            source_badge="${dim}${bcyan} [claude]${reset}"
-        elif [[ "$source" == "external" ]]; then
-            source_badge="${dim}${bmagenta} [added]${reset}"
+        # Snap scroll to row boundaries for clean grid rendering
+        if (( selected < scroll_offset )); then
+            scroll_offset=$(( (selected / grid_cols) * grid_cols ))
+        elif (( selected >= scroll_offset + max_items )); then
+            local sel_row=$(( selected / grid_cols ))
+            local top_row=$(( sel_row - grid_rows + 1 ))
+            (( top_row < 0 )) && top_row=0
+            scroll_offset=$(( top_row * grid_cols ))
         fi
 
-        if $compact_mode; then
-            # ── COMPACT MODE: single row per project ──
-            move_to "$row" 1
-            if (( fidx == selected )); then
-                tui '  %s>%s ' "${bgreen}${bold}" "${reset}"
-                tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$title" "${reset}"
+        if (( ${#filtered[@]} == 0 )); then
+            move_to "$list_start" 4
+            if [[ -n "$search_query" ]]; then
+                tui '%sNo matches for "%s"%s' "${dim}${yellow}" "$search_query" "${reset}"
             else
-                tui '  %s>%s ' "${dim}" "${reset}"
-                tui '%s%s%s' "${bold}${bwhite}" "$title" "${reset}"
+                tui '%sNo projects found%s' "${dim}" "${reset}"
             fi
+        fi
+
+        local i
+        for (( i = 0; i < max_items && i + scroll_offset < ${#filtered[@]}; i++ )); do
+            local fidx=$(( i + scroll_offset ))
+            local idx="${filtered[$fidx]}"
+            local title="${cache_title[$idx]}"
+            local lang_name="${cache_lang[$idx]}"
+            local lang_color="${cache_langcolor[$idx]}"
+
+            local grid_r=$(( i / grid_cols ))
+            local grid_c=$(( i % grid_cols ))
+            local row=$(( list_start + grid_r * cell_height ))
+            local col=$(( 2 + grid_c * cell_width ))
+
+            # Truncate title to fit cell
+            local max_title=$(( cell_width - 4 ))
+            local disp_title="$title"
+            if (( ${#disp_title} > max_title )); then
+                disp_title="${disp_title:0:$((max_title - 1))}\u2026"
+            fi
+
+            move_to "$row" "$col"
+            if (( fidx == selected )); then
+                tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$disp_title" "${reset}"
+            else
+                tui ' %s%s%s' "${bold}${bwhite}" "$disp_title" "${reset}"
+            fi
+
+            # Second row: language tag
+            move_to $(( row + 1 )) "$col"
             if [[ -n "$lang_name" ]]; then
-                tui '  %s%s%s' "${lang_color}" "$lang_name" "${reset}"
-            fi
-            if [[ -n "$framework" ]]; then
-                tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
-            fi
-            tui '  %s%s%s' "${dim}" "$rel_date" "${reset}"
-            tui '%s' "$source_badge"
-        else
-            # ── FULL MODE: 3 rows per project ──
-
-            # Truncate desc
-            local max_desc_len=$(( term_cols - 10 ))
-            (( max_desc_len > 70 )) && max_desc_len=70
-            if (( ${#desc} > max_desc_len )); then
-                desc="${desc:0:$((max_desc_len - 3))}..."
-            fi
-
-            # Check if base is a timestamp (all digits + underscore)
-            local base_is_ts=false
-            [[ "$base" =~ ^[0-9_]+$ ]] && base_is_ts=true
-
-            # For external dirs, show path instead of base
-            local display_path="$base"
-            if [[ "$source" != "local" ]]; then
-                display_path="${fullpath/#$HOME/~}"
-            fi
-
-            if (( fidx == selected )); then
-                # ── SELECTED ──
-                move_to "$row" 1
-                tui '  %s>%s ' "${bgreen}${bold}" "${reset}"
-                tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$title" "${reset}"
-
-                if [[ -n "$lang_name" ]]; then
-                    tui '  %s%s%s' "${lang_color}${bold}" "$lang_name" "${reset}"
+                local disp_lang="$lang_name"
+                if (( ${#disp_lang} > max_title )); then
+                    disp_lang="${disp_lang:0:$((max_title - 1))}\u2026"
                 fi
-                if [[ -n "$framework" ]]; then
-                    tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
-                fi
-                tui '%s' "$source_badge"
-
-                move_to $(( row + 1 )) 1
-                if [[ "$desc" != "$title" ]]; then
-                    tui '      %s%s%s' "${cyan}" "$desc" "${reset}"
-                fi
-
-                move_to $(( row + 2 )) 1
-                if $base_is_ts; then
-                    tui '      %s%s%s' "${dim}${yellow}" "$display_path" "${reset}"
-                else
-                    tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
-                fi
-                tui '  %s%s%s' "${bold}${yellow}" "$rel_date" "${reset}"
-                tui '  %s%s  %s files%s' "${dim}" "$date" "$file_count" "${reset}"
-
+                tui ' %s%s%s' "${lang_color}${dim}" "$disp_lang" "${reset}"
             else
-                # ── UNSELECTED ──
-                move_to "$row" 1
-                tui '  %s>%s ' "${dim}" "${reset}"
-                tui '%s%s%s' "${bold}${bwhite}" "$title" "${reset}"
+                tui ' %s--%s' "${dim}" "${reset}"
+            fi
+        done
 
-                if [[ -n "$lang_name" ]]; then
-                    tui '  %s%s%s' "${lang_color}${bold}" "$lang_name" "${reset}"
-                fi
-                if [[ -n "$framework" ]]; then
-                    tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
-                fi
-                tui '%s' "$source_badge"
+        # Scroll indicators for grid
+        if (( scroll_offset > 0 )); then
+            move_to $(( list_start - 1 )) 3
+            tui '%s^ more above%s' "${byellow}${bold}" "${reset}"
+        fi
+        if (( scroll_offset + max_items < ${#filtered[@]} )); then
+            local bottom_row=$(( list_start + grid_rows * cell_height ))
+            (( bottom_row > term_lines - 1 )) && bottom_row=$(( term_lines - 1 ))
+            move_to "$bottom_row" 3
+            tui '%sv more below%s' "${byellow}${bold}" "${reset}"
+        fi
+    else
+        # ── LIST MODES (compact / full) ──
+        local row_height=3
+        [[ "$display_mode" == "compact" ]] && row_height=1
+        local max_items=$(( (term_lines - list_start - 2) / row_height ))
+        (( max_items < 1 )) && max_items=1
 
-                move_to $(( row + 1 )) 1
-                if [[ "$desc" != "$title" ]]; then
-                    tui '      %s%s%s' "${dim}" "$desc" "${reset}"
-                fi
+        if (( selected < scroll_offset )); then
+            scroll_offset=$selected
+        elif (( selected >= scroll_offset + max_items )); then
+            scroll_offset=$(( selected - max_items + 1 ))
+        fi
 
-                move_to $(( row + 2 )) 1
-                if $base_is_ts; then
-                    tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
-                else
-                    tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
-                fi
-                tui '  %s%s  %s  %s files%s' "${dim}" "$rel_date" "$date" "$file_count" "${reset}"
+        if (( ${#filtered[@]} == 0 )); then
+            move_to "$list_start" 4
+            if [[ -n "$search_query" ]]; then
+                tui '%sNo matches for "%s"%s' "${dim}${yellow}" "$search_query" "${reset}"
+            else
+                tui '%sNo projects found%s' "${dim}" "${reset}"
             fi
         fi
-    done
 
-    # Scroll indicators
-    if (( scroll_offset > 0 )); then
-        move_to $(( list_start - 1 )) 3
-        tui '%s^ more above%s' "${byellow}${bold}" "${reset}"
-    fi
-    if (( scroll_offset + max_items < ${#filtered[@]} )); then
-        local bottom_row=$(( list_start + max_items * row_height ))
-        (( bottom_row > term_lines - 1 )) && bottom_row=$(( term_lines - 1 ))
-        move_to "$bottom_row" 3
-        tui '%sv more below%s' "${byellow}${bold}" "${reset}"
+        local i
+        for (( i = 0; i < max_items && i + scroll_offset < ${#filtered[@]}; i++ )); do
+            local fidx=$(( i + scroll_offset ))
+            local idx="${filtered[$fidx]}"
+            local title="${cache_title[$idx]}"
+            local base="${cache_base[$idx]}"
+            local date="${cache_date[$idx]}"
+            local rel_date="${cache_reldate[$idx]}"
+            local desc="${cache_desc[$idx]}"
+            local file_count="${cache_files[$idx]}"
+            local lang_name="${cache_lang[$idx]}"
+            local lang_color="${cache_langcolor[$idx]}"
+            local framework="${cache_framework[$idx]}"
+            local source="${cache_source[$idx]}"
+            local fullpath="${cache_fullpath[$idx]}"
+
+            local row=$(( list_start + i * row_height ))
+
+            # Source badge for non-local dirs
+            local source_badge=""
+            if [[ "$source" == "discovered" ]]; then
+                source_badge="${dim}${bcyan} [claude]${reset}"
+            elif [[ "$source" == "external" ]]; then
+                source_badge="${dim}${bmagenta} [added]${reset}"
+            fi
+
+            if [[ "$display_mode" == "compact" ]]; then
+                # ── COMPACT MODE: single row per project ──
+                move_to "$row" 1
+                if (( fidx == selected )); then
+                    tui '  %s>%s ' "${bgreen}${bold}" "${reset}"
+                    tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$title" "${reset}"
+                else
+                    tui '  %s>%s ' "${dim}" "${reset}"
+                    tui '%s%s%s' "${bold}${bwhite}" "$title" "${reset}"
+                fi
+                if [[ -n "$lang_name" ]]; then
+                    tui '  %s%s%s' "${lang_color}" "$lang_name" "${reset}"
+                fi
+                if [[ -n "$framework" ]]; then
+                    tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
+                fi
+                tui '  %s%s%s' "${dim}" "$rel_date" "${reset}"
+                tui '%s' "$source_badge"
+            else
+                # ── FULL MODE: 3 rows per project ──
+
+                # Truncate desc
+                local max_desc_len=$(( term_cols - 10 ))
+                (( max_desc_len > 70 )) && max_desc_len=70
+                if (( ${#desc} > max_desc_len )); then
+                    desc="${desc:0:$((max_desc_len - 3))}..."
+                fi
+
+                # Check if base is a timestamp (all digits + underscore)
+                local base_is_ts=false
+                [[ "$base" =~ ^[0-9_]+$ ]] && base_is_ts=true
+
+                # For external dirs, show path instead of base
+                local display_path="$base"
+                if [[ "$source" != "local" ]]; then
+                    display_path="${fullpath/#$HOME/~}"
+                fi
+
+                if (( fidx == selected )); then
+                    # ── SELECTED ──
+                    move_to "$row" 1
+                    tui '  %s>%s ' "${bgreen}${bold}" "${reset}"
+                    tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$title" "${reset}"
+
+                    if [[ -n "$lang_name" ]]; then
+                        tui '  %s%s%s' "${lang_color}${bold}" "$lang_name" "${reset}"
+                    fi
+                    if [[ -n "$framework" ]]; then
+                        tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
+                    fi
+                    tui '%s' "$source_badge"
+
+                    move_to $(( row + 1 )) 1
+                    if [[ "$desc" != "$title" ]]; then
+                        tui '      %s%s%s' "${cyan}" "$desc" "${reset}"
+                    fi
+
+                    move_to $(( row + 2 )) 1
+                    if $base_is_ts; then
+                        tui '      %s%s%s' "${dim}${yellow}" "$display_path" "${reset}"
+                    else
+                        tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
+                    fi
+                    tui '  %s%s%s' "${bold}${yellow}" "$rel_date" "${reset}"
+                    tui '  %s%s  %s files%s' "${dim}" "$date" "$file_count" "${reset}"
+
+                else
+                    # ── UNSELECTED ──
+                    move_to "$row" 1
+                    tui '  %s>%s ' "${dim}" "${reset}"
+                    tui '%s%s%s' "${bold}${bwhite}" "$title" "${reset}"
+
+                    if [[ -n "$lang_name" ]]; then
+                        tui '  %s%s%s' "${lang_color}${bold}" "$lang_name" "${reset}"
+                    fi
+                    if [[ -n "$framework" ]]; then
+                        tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
+                    fi
+                    tui '%s' "$source_badge"
+
+                    move_to $(( row + 1 )) 1
+                    if [[ "$desc" != "$title" ]]; then
+                        tui '      %s%s%s' "${dim}" "$desc" "${reset}"
+                    fi
+
+                    move_to $(( row + 2 )) 1
+                    if $base_is_ts; then
+                        tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
+                    else
+                        tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
+                    fi
+                    tui '  %s%s  %s  %s files%s' "${dim}" "$rel_date" "$date" "$file_count" "${reset}"
+                fi
+            fi
+        done
+
+        # Scroll indicators
+        if (( scroll_offset > 0 )); then
+            move_to $(( list_start - 1 )) 3
+            tui '%s^ more above%s' "${byellow}${bold}" "${reset}"
+        fi
+        if (( scroll_offset + max_items < ${#filtered[@]} )); then
+            local bottom_row=$(( list_start + max_items * row_height ))
+            (( bottom_row > term_lines - 1 )) && bottom_row=$(( term_lines - 1 ))
+            move_to "$bottom_row" 3
+            tui '%sv more below%s' "${byellow}${bold}" "${reset}"
+        fi
     fi
 
     # Status bar
@@ -1088,12 +1172,14 @@ do_add_dir() {
 }
 
 do_toggle_compact() {
-    if $compact_mode; then
-        compact_mode=false
-    else
-        compact_mode=true
-    fi
+    case "$display_mode" in
+        compact) display_mode="full" ;;
+        full)    display_mode="grid" ;;
+        grid)    display_mode="compact" ;;
+    esac
     scroll_offset=0
+    status_msg="View: $display_mode"
+    status_color="${byellow}${bold}"
 }
 
 do_about() {
@@ -1107,7 +1193,7 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  1.0.0' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  1.1.0' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     tui '  %sCreated by:%s  James Kinsman' "${bold}${bwhite}" "${reset}"
@@ -1132,7 +1218,7 @@ do_about() {
     (( row += 1 ))
     move_to "$row" 1; tui '    %sR%s      smart rename directory      %se%s  edit description' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
-    move_to "$row" 1; tui '    %sc%s      toggle compact/full view    %sp%s  toggle local/all view' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    move_to "$row" 1; tui '    %sc%s      cycle view mode             %sp%s  toggle local/all view' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1; tui '    %st%s      cycle sort mode             %sa%s  add external directory' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
@@ -1176,9 +1262,40 @@ main() {
         local key
         key=$(read_key) || { action="quit"; break; }
 
+        # Compute grid_cols for navigation (must match draw)
+        local nav_grid_cols=1
+        if [[ "$display_mode" == "grid" ]]; then
+            local _tc
+            _tc=$(tput_cols)
+            nav_grid_cols=$(( (_tc - 2) / 24 ))
+            (( nav_grid_cols < 1 )) && nav_grid_cols=1
+        fi
+
         case "$key" in
-            $'\e[A' | k)  (( selected > 0 )) && (( selected-- )) ;;
-            $'\e[B' | j)  (( selected < ${#filtered[@]} - 1 )) && (( selected++ )) || true ;;
+            $'\e[A' | k)
+                if [[ "$display_mode" == "grid" ]]; then
+                    (( selected >= nav_grid_cols )) && (( selected -= nav_grid_cols ))
+                else
+                    (( selected > 0 )) && (( selected-- ))
+                fi
+                ;;
+            $'\e[B' | j)
+                if [[ "$display_mode" == "grid" ]]; then
+                    (( selected + nav_grid_cols < ${#filtered[@]} )) && (( selected += nav_grid_cols )) || true
+                else
+                    (( selected < ${#filtered[@]} - 1 )) && (( selected++ )) || true
+                fi
+                ;;
+            $'\e[D' | h)
+                if [[ "$display_mode" == "grid" ]]; then
+                    (( selected > 0 )) && (( selected-- ))
+                fi
+                ;;
+            $'\e[C' | l)
+                if [[ "$display_mode" == "grid" ]]; then
+                    (( selected < ${#filtered[@]} - 1 )) && (( selected++ )) || true
+                fi
+                ;;
             $'\e[5~')     (( selected -= 5 )); (( selected < 0 )) && selected=0 ;;
             $'\e[6~')     (( selected += 5 )); (( selected >= ${#filtered[@]} )) && selected=$(( ${#filtered[@]} - 1 )); (( selected < 0 )) && selected=0 ;;
             "")           do_open ;;
