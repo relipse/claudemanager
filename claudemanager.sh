@@ -65,6 +65,7 @@ status_color="$green"
 search_query=""
 sort_mode="date"       # date | name | language
 view_mode="local"      # local | all
+compact_mode=true      # start compact, toggle with 'c'
 
 # ── Cache arrays (parallel to dirs[]) ────────────────────────────
 declare -a dirs=()
@@ -536,7 +537,9 @@ draw() {
     # View + sort indicators
     local view_label="local"
     [[ "$view_mode" == "all" ]] && view_label="all projects"
-    tui '  %s[%s | sort:%s]%s' "${dim}${italic}" "$view_label" "$sort_mode" "${reset}"
+    local compact_label=""
+    $compact_mode && compact_label=" | compact"
+    tui '  %s[%s | sort:%s%s]%s' "${dim}${italic}" "$view_label" "$sort_mode" "$compact_label" "${reset}"
 
     # Keybindings bar
     move_to 2 1
@@ -546,9 +549,11 @@ draw() {
     tui '%s n %s new  '         "${bg_green}${black}${bold}"    "${reset}${dim}"
     tui '%s p %s all  '         "${bg_cyan}${black}${bold}"     "${reset}${dim}"
     tui '%s t %s sort  '        "${bg_yellow}${black}${bold}"   "${reset}${dim}"
+    tui '%s c %s compact  '      "${bg_yellow}${black}${bold}"   "${reset}${dim}"
     tui '%s a %s add  '         "${bg_magenta}${white}${bold}"  "${reset}${dim}"
     tui '%s R %s rename  '       "${bg_cyan}${black}${bold}"     "${reset}${dim}"
     tui '%s d %s del  '         "${bg_red}${white}${bold}"      "${reset}${dim}"
+    tui '%s ? %s about  '       "${bg_gray}${bwhite}${bold}"    "${reset}${dim}"
     tui '%s q %s quit'          "${bg_gray}${bwhite}${bold}"    "${reset}${dim}"
     tui '%s' "${reset}"
 
@@ -571,6 +576,7 @@ draw() {
     # ── List area ──
     local list_start=$(( header_end + 1 ))
     local row_height=3
+    $compact_mode && row_height=1
     local max_items=$(( (term_lines - list_start - 2) / row_height ))
     (( max_items < 1 )) && max_items=1
 
@@ -607,17 +613,6 @@ draw() {
 
         local row=$(( list_start + i * row_height ))
 
-        # Truncate desc
-        local max_desc_len=$(( term_cols - 10 ))
-        (( max_desc_len > 70 )) && max_desc_len=70
-        if (( ${#desc} > max_desc_len )); then
-            desc="${desc:0:$((max_desc_len - 3))}..."
-        fi
-
-        # Check if base is a timestamp (all digits + underscore)
-        local base_is_ts=false
-        [[ "$base" =~ ^[0-9_]+$ ]] && base_is_ts=true
-
         # Source badge for non-local dirs
         local source_badge=""
         if [[ "$source" == "discovered" ]]; then
@@ -626,74 +621,99 @@ draw() {
             source_badge="${dim}${bmagenta} [added]${reset}"
         fi
 
-        # For external dirs, show path instead of base
-        local display_path="$base"
-        if [[ "$source" != "local" ]]; then
-            # Shorten home prefix
-            display_path="${fullpath/#$HOME/~}"
-        fi
-
-        if (( fidx == selected )); then
-            # ── SELECTED ──
-            # Row 1: Big app title
+        if $compact_mode; then
+            # ── COMPACT MODE: single row per project ──
             move_to "$row" 1
-            tui '  %s>%s ' "${bgreen}${bold}" "${reset}"
-            tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$title" "${reset}"
-
-            # Language + framework tags
+            if (( fidx == selected )); then
+                tui '  %s>%s ' "${bgreen}${bold}" "${reset}"
+                tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$title" "${reset}"
+            else
+                tui '  %s>%s ' "${dim}" "${reset}"
+                tui '%s%s%s' "${bold}${bwhite}" "$title" "${reset}"
+            fi
             if [[ -n "$lang_name" ]]; then
-                tui '  %s%s%s' "${lang_color}${bold}" "$lang_name" "${reset}"
+                tui '  %s%s%s' "${lang_color}" "$lang_name" "${reset}"
             fi
             if [[ -n "$framework" ]]; then
                 tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
             fi
+            tui '  %s%s%s' "${dim}" "$rel_date" "${reset}"
             tui '%s' "$source_badge"
-
-            # Row 2: Description + dir info
-            move_to $(( row + 1 )) 1
-            if [[ "$desc" != "$title" ]]; then
-                tui '      %s%s%s' "${cyan}" "$desc" "${reset}"
-            fi
-
-            # Row 3: Dir name + meta
-            move_to $(( row + 2 )) 1
-            if $base_is_ts; then
-                tui '      %s%s%s' "${dim}${yellow}" "$display_path" "${reset}"
-            else
-                tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
-            fi
-            tui '  %s%s%s' "${bold}${yellow}" "$rel_date" "${reset}"
-            tui '  %s%s  %s files%s' "${dim}" "$date" "$file_count" "${reset}"
-
         else
-            # ── UNSELECTED ──
-            # Row 1: App title
-            move_to "$row" 1
-            tui '  %s>%s ' "${dim}" "${reset}"
-            tui '%s%s%s' "${bold}${bwhite}" "$title" "${reset}"
+            # ── FULL MODE: 3 rows per project ──
 
-            if [[ -n "$lang_name" ]]; then
-                tui '  %s%s%s' "${lang_color}${bold}" "$lang_name" "${reset}"
-            fi
-            if [[ -n "$framework" ]]; then
-                tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
-            fi
-            tui '%s' "$source_badge"
-
-            # Row 2: Description
-            move_to $(( row + 1 )) 1
-            if [[ "$desc" != "$title" ]]; then
-                tui '      %s%s%s' "${dim}" "$desc" "${reset}"
+            # Truncate desc
+            local max_desc_len=$(( term_cols - 10 ))
+            (( max_desc_len > 70 )) && max_desc_len=70
+            if (( ${#desc} > max_desc_len )); then
+                desc="${desc:0:$((max_desc_len - 3))}..."
             fi
 
-            # Row 3: Dir name + meta
-            move_to $(( row + 2 )) 1
-            if $base_is_ts; then
-                tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
+            # Check if base is a timestamp (all digits + underscore)
+            local base_is_ts=false
+            [[ "$base" =~ ^[0-9_]+$ ]] && base_is_ts=true
+
+            # For external dirs, show path instead of base
+            local display_path="$base"
+            if [[ "$source" != "local" ]]; then
+                display_path="${fullpath/#$HOME/~}"
+            fi
+
+            if (( fidx == selected )); then
+                # ── SELECTED ──
+                move_to "$row" 1
+                tui '  %s>%s ' "${bgreen}${bold}" "${reset}"
+                tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$title" "${reset}"
+
+                if [[ -n "$lang_name" ]]; then
+                    tui '  %s%s%s' "${lang_color}${bold}" "$lang_name" "${reset}"
+                fi
+                if [[ -n "$framework" ]]; then
+                    tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
+                fi
+                tui '%s' "$source_badge"
+
+                move_to $(( row + 1 )) 1
+                if [[ "$desc" != "$title" ]]; then
+                    tui '      %s%s%s' "${cyan}" "$desc" "${reset}"
+                fi
+
+                move_to $(( row + 2 )) 1
+                if $base_is_ts; then
+                    tui '      %s%s%s' "${dim}${yellow}" "$display_path" "${reset}"
+                else
+                    tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
+                fi
+                tui '  %s%s%s' "${bold}${yellow}" "$rel_date" "${reset}"
+                tui '  %s%s  %s files%s' "${dim}" "$date" "$file_count" "${reset}"
+
             else
-                tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
+                # ── UNSELECTED ──
+                move_to "$row" 1
+                tui '  %s>%s ' "${dim}" "${reset}"
+                tui '%s%s%s' "${bold}${bwhite}" "$title" "${reset}"
+
+                if [[ -n "$lang_name" ]]; then
+                    tui '  %s%s%s' "${lang_color}${bold}" "$lang_name" "${reset}"
+                fi
+                if [[ -n "$framework" ]]; then
+                    tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
+                fi
+                tui '%s' "$source_badge"
+
+                move_to $(( row + 1 )) 1
+                if [[ "$desc" != "$title" ]]; then
+                    tui '      %s%s%s' "${dim}" "$desc" "${reset}"
+                fi
+
+                move_to $(( row + 2 )) 1
+                if $base_is_ts; then
+                    tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
+                else
+                    tui '      %s%s%s' "${dim}" "$display_path" "${reset}"
+                fi
+                tui '  %s%s  %s  %s files%s' "${dim}" "$rel_date" "$date" "$file_count" "${reset}"
             fi
-            tui '  %s%s  %s  %s files%s' "${dim}" "$rel_date" "$date" "$file_count" "${reset}"
         fi
     done
 
@@ -1067,6 +1087,64 @@ do_add_dir() {
     status_color="${bgreen}${bold}"
 }
 
+do_toggle_compact() {
+    if $compact_mode; then
+        compact_mode=false
+    else
+        compact_mode=true
+    fi
+    scroll_offset=0
+}
+
+do_about() {
+    clear_screen
+    local term_lines term_cols
+    term_lines=$(tput_lines)
+    term_cols=$(tput_cols)
+
+    local row=3
+    move_to "$row" 1
+    tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
+    (( row += 2 ))
+    move_to "$row" 1
+    tui '  %sVersion:%s  1.0.0' "${bold}${bwhite}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1
+    tui '  %sCreated by:%s  James Kinsman' "${bold}${bwhite}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1
+    tui '  %sWebsite:%s    https://kinsman.cc' "${bold}${bwhite}" "${reset}"
+    (( row += 2 ))
+    move_to "$row" 1
+    tui '  %sA colorful TUI for managing Claude Code project directories.%s' "${dim}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1
+    tui '  %sNavigate, search, rename, and launch projects from one place.%s' "${dim}" "${reset}"
+    (( row += 2 ))
+    move_to "$row" 1
+    tui '  %sKeybindings:%s' "${bold}${bcyan}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1; tui '    %senter%s  open project in claude    %ss%s  open shell in project dir' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1; tui '    %s/%s      search/filter              %sn%s  create new project' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1; tui '    %sr%s      set display title           %sm%s  rename directory' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1; tui '    %sR%s      smart rename directory      %se%s  edit description' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1; tui '    %sc%s      toggle compact/full view    %sp%s  toggle local/all view' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1; tui '    %st%s      cycle sort mode             %sa%s  add external directory' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1; tui '    %sd%s      delete project              %s?%s  this screen' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1; tui '    %sj/k%s    navigate up/down            %sq%s  quit' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+
+    move_to "$term_lines" 1
+    tui '  %sPress any key to return...%s' "${dim}" "${reset}"
+    read_key > /dev/null
+}
+
 do_new()   { action="new"; }
 do_open()  {
     (( ${#filtered[@]} == 0 )) && return
@@ -1113,9 +1191,11 @@ main() {
             e)            do_edit_desc ;;
             d)            do_delete ;;
             s)            do_shell ;;
+            c)            do_toggle_compact ;;
             p)            do_toggle_view ;;
             t)            do_toggle_sort ;;
             a)            do_add_dir ;;
+            ?)            do_about ;;
             q)            action="quit" ;;
         esac
 
