@@ -5,7 +5,7 @@
 
 set -uo pipefail
 
-CLAUDE_BASE="${CLAUDE_BASE:-$HOME/util/claude}"
+CLAUDE_BASE="${CLAUDE_BASE:-$HOME/.claudemanager}"
 CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
 EXTRA_DIRS_FILE="$CLAUDE_BASE/.claudemanager_dirs"
 
@@ -550,7 +550,7 @@ draw() {
     tui '%s p %s all  '         "${bg_cyan}${black}${bold}"     "${reset}${dim}"
     tui '%s t %s sort  '        "${bg_yellow}${black}${bold}"   "${reset}${dim}"
     tui '%s c %s view  '          "${bg_yellow}${black}${bold}"   "${reset}${dim}"
-    tui '%s a %s add  '         "${bg_magenta}${white}${bold}"  "${reset}${dim}"
+    tui '%s a %s add  '         "${bg_green}${black}${bold}"  "${reset}${dim}"
     tui '%s R %s rename  '       "${bg_cyan}${black}${bold}"     "${reset}${dim}"
     tui '%s d %s del  '         "${bg_red}${white}${bold}"      "${reset}${dim}"
     tui '%s ? %s about  '       "${bg_gray}${bwhite}${bold}"    "${reset}${dim}"
@@ -701,7 +701,7 @@ draw() {
             if [[ "$source" == "discovered" ]]; then
                 source_badge="${dim}${bcyan} [claude]${reset}"
             elif [[ "$source" == "external" ]]; then
-                source_badge="${dim}${bmagenta} [added]${reset}"
+                source_badge="${dim}${bcyan} [added]${reset}"
             fi
 
             if [[ "$display_mode" == "compact" ]]; then
@@ -1193,13 +1193,16 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  1.1.0' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  1.2.0' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
-    tui '  %sCreated by:%s  James Kinsman' "${bold}${bwhite}" "${reset}"
+    tui '  %sCreated by:%s  Kinsman Software LLC' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     tui '  %sWebsite:%s    https://kinsman.cc' "${bold}${bwhite}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1
+    tui '  %sGitHub:%s     https://github.com/relipse/claudemanager' "${bold}${bwhite}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
     tui '  %sA colorful TUI for managing Claude Code project directories.%s' "${dim}" "${reset}"
