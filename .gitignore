@@ -1,2 +1,8 @@
 .DS_Store
 .claudemanager_dirs
+.claudemanager_cache
+.claudemanager_dirlist
+.claudemanager_prefs
+.claudemanager_history
+.claudemanager_groups
+.claude/
