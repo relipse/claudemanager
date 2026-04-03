@@ -74,6 +74,7 @@ display_mode="compact"  # compact | full | grid
 title_mode="scroll_region" # none | window_title | tmux_split | tmux_status | scroll_region | prompt
 auto_claude="on"       # on | off
 match_threshold=95     # 0-100, minimum similarity % for quick-open
+demo_mode="off"        # off | on — anonymize project names/paths for screenshots
 
 # ── Preferences persistence ──────────────────────────────────────
 _load_prefs() {
@@ -87,16 +88,100 @@ _load_prefs() {
             title_mode)   title_mode="$val" ;;
             auto_claude)      auto_claude="$val" ;;
             match_threshold)  match_threshold="$val" ;;
+            demo_mode)        demo_mode="$val" ;;
         esac
     done < "$PREFS_FILE"
 }
 
 _save_prefs() {
-    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\n' \
-        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" > "$PREFS_FILE"
+    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\ndemo_mode=%s\n' \
+        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" "$demo_mode" > "$PREFS_FILE"
 }
 
 _load_prefs
+
+# ── Demo mode: anonymize sensitive data for screenshots ──────────
+declare -A _demo_map=()
+_demo_counter=0
+
+# Word pools for generating fake project names
+_demo_animals=(Falcon Eagle Panther Wolf Tiger Cobra Raven Phoenix Dragon Hawk
+               Viper Lynx Bear Orca Puma Jaguar Osprey Fox Bison Crane)
+_demo_adjectives=(Swift Bright Vivid Silent Rapid Bold Agile Prime Noble Spark
+                  Crimson Azure Neon Iron Frost Solar Storm Cloud Echo Zen)
+_demo_nouns=(Tracker Builder Vault Engine Relay Forge Nexus Beacon Pulse Signal
+             Matrix Portal Bridge Runner Studio Scope Craft Harbor Anchor Grid)
+
+_demo_name() {
+    # Deterministic anonymized name for a given input string
+    local input="$1"
+    if [[ -n "${_demo_map[$input]:-}" ]]; then
+        printf '%s' "${_demo_map[$input]}"
+        return
+    fi
+    local adj_i=$(( _demo_counter % ${#_demo_adjectives[@]} ))
+    local noun_i=$(( _demo_counter / ${#_demo_adjectives[@]} % ${#_demo_nouns[@]} ))
+    local name="${_demo_adjectives[$adj_i]}${_demo_nouns[$noun_i]}"
+    _demo_map["$input"]="$name"
+    (( _demo_counter++ ))
+    printf '%s' "$name"
+}
+
+_demo_path() {
+    # Anonymize a path, keeping structure but replacing leaf names
+    local p="$1"
+    local base="${p##*/}"
+    local anon_base
+    anon_base=$(_demo_name "$base")
+    printf '~/projects/%s' "$anon_base"
+}
+
+_demo_desc() {
+    # Anonymize a description
+    local desc="$1"
+    [[ -z "$desc" ]] && return
+    local anon
+    anon=$(_demo_name "$desc")
+    printf '%s project files' "$anon"
+}
+
+_demo_group() {
+    # Anonymize a group name
+    local g="$1"
+    [[ -z "$g" ]] && return
+    local animal_i
+    animal_i=$(( $(printf '%s' "$g" | cksum | cut -d' ' -f1) % ${#_demo_animals[@]} ))
+    printf 'Client %s' "${_demo_animals[$animal_i]}"
+}
+
+_apply_demo_mode() {
+    # Replace cache arrays with anonymized versions. Call after load_dirs + _apply_groups_to_cache.
+    [[ "$demo_mode" != "on" ]] && return
+    _demo_map=()
+    _demo_counter=0
+
+    local total=${#dirs[@]}
+    for (( i = 0; i < total; i++ )); do
+        cache_title[$i]="$(_demo_name "${cache_title[$i]}")"
+        cache_base[$i]="$(_demo_name "${cache_base[$i]}")"
+        cache_desc[$i]="$(_demo_desc "${cache_desc[$i]}")"
+        cache_fullpath[$i]="$(_demo_path "${cache_fullpath[$i]}")"
+        if [[ -n "${cache_group[$i]:-}" ]]; then
+            cache_group[$i]="$(_demo_group "${cache_group[$i]}")"
+        fi
+    done
+
+    # Also anonymize group_map display (groups screen reads from this)
+    local -A new_group_map=()
+    for path in "${!group_map[@]}"; do
+        local anon_g
+        anon_g=$(_demo_group "${group_map[$path]}")
+        new_group_map["$path"]="$anon_g"
+    done
+    for path in "${!group_map[@]}"; do
+        group_map["$path"]="${new_group_map[$path]}"
+    done
+}
 
 # ── Open history (last-opened timestamps per directory) ──────────
 declare -A open_history=()
@@ -1536,6 +1621,7 @@ do_delete() {
         fi
         load_dirs
         _apply_groups_to_cache
+    _apply_demo_mode
         if (( selected >= ${#filtered[@]} )); then
             selected=$(( ${#filtered[@]} - 1 ))
             (( selected < 0 )) && selected=0
@@ -1555,6 +1641,7 @@ do_delete() {
 do_refresh() {
     load_dirs "true"
     _apply_groups_to_cache
+    _apply_demo_mode
     selected=0
     scroll_offset=0
     status_msg="Refreshed all projects"
@@ -1574,6 +1661,7 @@ do_toggle_view() {
     scroll_offset=0
     load_dirs
     _apply_groups_to_cache
+    _apply_demo_mode
     _save_prefs
 }
 
@@ -1625,6 +1713,7 @@ do_add_dir() {
     printf '%s\n' "$path" >> "$EXTRA_DIRS_FILE"
     load_dirs
     _apply_groups_to_cache
+    _apply_demo_mode
     status_msg="Added: $path"
     status_color="${bgreen}${bold}"
 }
@@ -2805,8 +2894,28 @@ _tmux_display_value() {
     esac
 }
 
+_draw_setting_row() {
+    # Draw a single setting row with label, value, description, and optional highlight
+    local row="$1" is_selected="$2" label="$3" value="$4" desc="$5" val_color="${6:-}"
+
+    move_to "$row" 1
+    if (( is_selected )); then
+        tui '  %s>%s ' "${bgreen}${bold}" "${reset}"
+        tui '%s%s%s' "${bwhite}${bold}" "$label" "${reset}"
+        [[ -z "$val_color" ]] && val_color="${bg_sel}${bwhite}${bold}"
+        tui '   %s< %s%s%s >%s' "${dim}" "$val_color" "$value" "${reset}${dim}" "${reset}"
+        (( row++ ))
+        move_to "$row" 1
+        tui '      %s%s%s' "${dim}" "$desc" "${reset}"
+    else
+        tui '    '
+        tui '%s%s%s' "${white}" "$label" "${reset}"
+        tui '   %s%s%s' "${dim}" "$value" "${reset}"
+    fi
+}
+
 _draw_settings() {
-    local sel="$1"
+    local sel="$1" page="${2:-1}"
     clear_screen
     local term_lines term_cols
     term_lines=$(tput_lines)
@@ -2818,7 +2927,11 @@ _draw_settings() {
     tui '                              '
     move_to 1 1
     tui '%s  S E T T I N G S  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv1.3.0%s' "${dim}" "${reset}"
+    if (( page == 1 )); then
+        tui '  %s[1/2]  General%s' "${dim}" "${reset}"
+    else
+        tui '  %s[2/2]  Advanced%s' "${dim}" "${reset}"
+    fi
 
     # Separator
     move_to 3 1
@@ -2826,99 +2939,101 @@ _draw_settings() {
     (( sep_len > 70 )) && sep_len=70
     tui '  %s%s%s' "${dim}${cyan}" "$(printf '%*s' "$sep_len" '' | tr ' ' '-')" "${reset}"
 
-    # Setting labels and values
-    local -a labels=("View Mode" "Display Mode" "Sort Mode" "Title Persistence" "Auto-launch Claude")
-    local -a raw_values=("$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude")
-
     local row=5
-    for (( i = 0; i < ${#labels[@]}; i++ )); do
-        move_to "$row" 1
-        local display_val="${raw_values[$i]}"
-        # Show tmux availability status for title_mode
-        if (( i == 3 )); then
-            display_val=$(_tmux_display_value "$display_val")
-        fi
-        if (( i == sel )); then
-            tui '  %s>%s ' "${bwhite}${bold}" "${reset}"
-            tui '%s%-22s%s' "${bwhite}${bold}" "${labels[$i]}" "${reset}"
-            # Show warning color for unavailable tmux options
-            local val_color="${bg_sel}${bwhite}${bold}"
-            if (( i == 3 )) && ! _has_tmux; then
-                case "${raw_values[$i]}" in
-                    tmux_split|tmux_status) val_color="${bg_red}${bwhite}${bold}" ;;
-                esac
-            fi
-            tui '  %s< %s%s%s >%s' "${dim}" "$val_color" "$display_val" "${reset}${dim}" "${reset}"
-        else
-            tui '    '
-            tui '%s%-22s%s' "${dim}" "${labels[$i]}" "${reset}"
-            tui '    %s%s%s' "${white}" "$display_val" "${reset}"
-        fi
-        (( row++ ))
-    done
 
-    # Separator
-    (( row += 1 ))
-    move_to "$row" 1
-    tui '  %s%s%s' "${dim}${cyan}" "$(printf '%*s' "$sep_len" '' | tr ' ' '-')" "${reset}"
+    if (( page == 1 )); then
+        # ── Page 1: General ──
+        # 0: View Mode
+        _draw_setting_row "$row" "$(( sel == 0 ))" "View Mode" "$view_mode" \
+            "local = your projects only  |  all = include Claude Code history"
+        (( row += (sel == 0 ? 3 : 2) ))
 
-    # Contextual help
-    (( row += 1 ))
-    local -a help_lines=()
-    case "$sel" in
-        0) help_lines=("local: Show only projects in CLAUDE_BASE"
-                       "all:   Also show projects from Claude Code history") ;;
-        1) help_lines=("compact: Single line per project"
-                       "full:    Multi-line with metadata"
-                       "grid:    Cell-based layout") ;;
-        2) help_lines=("date:     Sort by last modified"
-                       "recent:   Sort by last opened in claudemanager"
-                       "name:     Sort alphabetically"
-                       "language: Sort by detected language") ;;
-        3)
-            help_lines=("Window/tab title is ALWAYS set regardless of this setting."
-                       ""
-                       "none:          Window/tab title only"
-                       "window_title:  Same as none (tab title always active)"
-                       "tmux_split:    Launch in tmux with title pane"
-                       "tmux_status:   Use tmux status bar (when in tmux)"
-                       "scroll_region: ANSI scroll region (experimental)"
-                       "prompt:        Show title in shell prompt after exit")
+        # 1: Display Mode
+        _draw_setting_row "$row" "$(( sel == 1 ))" "Display Mode" "$display_mode" \
+            "compact = single line  |  full = multi-line  |  grid = cells"
+        (( row += (sel == 1 ? 3 : 2) ))
+
+        # 2: Sort Mode
+        _draw_setting_row "$row" "$(( sel == 2 ))" "Sort Mode" "$sort_mode" \
+            "date = modified  |  recent = last opened  |  name  |  language"
+        (( row += (sel == 2 ? 3 : 2) ))
+
+        # 3: Demo Mode
+        local demo_desc="Anonymize all project names, paths & groups for screenshots"
+        local demo_val_color=""
+        [[ "$demo_mode" == "on" ]] && demo_val_color="${bg_magenta}${bwhite}${bold}"
+        _draw_setting_row "$row" "$(( sel == 3 ))" "Demo Mode" "$demo_mode" \
+            "$demo_desc" "$demo_val_color"
+
+    else
+        # ── Page 2: Advanced ──
+        # 0: Title Persistence
+        local tp_display
+        tp_display=$(_tmux_display_value "$title_mode")
+        local tp_val_color=""
+        if ! _has_tmux; then
+            case "$title_mode" in
+                tmux_split|tmux_status) tp_val_color="${bg_red}${bwhite}${bold}" ;;
+            esac
+        fi
+        _draw_setting_row "$row" "$(( sel == 0 ))" "Title Persistence" "$tp_display" \
+            "How to show the project name while Claude is running" "$tp_val_color"
+        if (( sel == 0 )); then
+            (( row += 3 ))
+            # Extra detail for title mode
+            local -a tp_opts=(
+                "none:          Window/tab title only"
+                "window_title:  Same as none"
+                "tmux_split:    Launch in tmux with title pane"
+                "tmux_status:   Use tmux status bar (in tmux)"
+                "scroll_region: ANSI scroll region (experimental)"
+                "prompt:        Show in shell prompt after exit"
+            )
+            for opt in "${tp_opts[@]}"; do
+                move_to "$row" 1
+                tui '      %s%s%s' "${dim}" "$opt" "${reset}"
+                (( row++ ))
+            done
             if ! _has_tmux; then
-                help_lines+=("" "tmux is NOT installed. Press 'i' to install it.")
-            else
-                help_lines+=("" "tmux is installed.")
+                move_to "$row" 1
+                tui '      %stmux is NOT installed. Press i to install.%s' "${bred}${bold}" "${reset}"
+                (( row++ ))
             fi
-            ;;
-        4) help_lines=("on:  Automatically run claude when opening a project"
-                       "off: Only cd into the directory") ;;
-    esac
+        else
+            (( row += 2 ))
+        fi
 
-    for line in "${help_lines[@]}"; do
-        move_to "$row" 1
-        tui '    %s%s%s' "${dim}" "$line" "${reset}"
-        (( row++ ))
-    done
+        # 1: Auto-launch Claude
+        _draw_setting_row "$row" "$(( sel == 1 ))" "Auto-launch Claude" "$auto_claude" \
+            "on = run claude on open  |  off = just cd into directory"
+        (( row += (sel == 1 ? 3 : 2) ))
 
-    # Status message (from install, etc.)
+        # 2: Match Threshold
+        _draw_setting_row "$row" "$(( sel == 2 ))" "Quick-open Threshold" "${match_threshold}%" \
+            "Minimum similarity % for instant open (0-100, higher = stricter)"
+    fi
+
+    # Status message
     if [[ -n "${_settings_status:-}" ]]; then
-        (( row += 1 ))
-        move_to "$row" 1
+        move_to $(( term_lines - 3 )) 1
         tui '    %s%s%s' "${_settings_status_color:-$bwhite}" "$_settings_status" "${reset}"
     fi
 
     # Footer
     move_to "$term_lines" 1
     tui '  '
-    tui '%s <-/-> %s change  ' "${bg_gray}${bwhite}${bold}" "${reset}${dim}"
-    tui '%s up/dn %s navigate  ' "${bg_gray}${bwhite}${bold}" "${reset}${dim}"
-    if (( sel == 3 )) && ! _has_tmux; then
+    tui '%s <- / -> %s change  ' "${bg_gray}${bwhite}${bold}" "${reset}${dim}"
+    tui '%s up / dn %s navigate  ' "${bg_gray}${bwhite}${bold}" "${reset}${dim}"
+    tui '%s tab %s page %d/2  ' "${bg_cyan}${black}${bold}" "${reset}${dim}" "$page"
+    if (( page == 2 && sel == 0 )) && ! _has_tmux; then
         tui '%s i %s install tmux  ' "${bg_green}${black}${bold}" "${reset}${dim}"
     fi
-    tui '%s x %s export  ' "${bg_cyan}${black}${bold}" "${reset}${dim}"
-    tui '%s m %s import  ' "${bg_cyan}${black}${bold}" "${reset}${dim}"
+    if (( page == 2 )); then
+        tui '%s x %s export  ' "${bg_cyan}${black}${bold}" "${reset}${dim}"
+        tui '%s m %s import  ' "${bg_cyan}${black}${bold}" "${reset}${dim}"
+    fi
     tui '%s enter %s save  ' "${bg_green}${black}${bold}" "${reset}${dim}"
-    tui '%s q/esc %s discard'  "${bg_red}${white}${bold}" "${reset}${dim}"
+    tui '%s q %s discard'  "${bg_red}${white}${bold}" "${reset}${dim}"
     tui '%s' "${reset}"
 }
 
@@ -2969,12 +3084,16 @@ _settings_has_changes() {
     [[ "$display_mode" != "$_orig_display_mode" ]] || \
     [[ "$sort_mode" != "$_orig_sort_mode" ]] || \
     [[ "$title_mode" != "$_orig_title_mode" ]] || \
-    [[ "$auto_claude" != "$_orig_auto_claude" ]]
+    [[ "$auto_claude" != "$_orig_auto_claude" ]] || \
+    [[ "$demo_mode" != "$_orig_demo_mode" ]] || \
+    [[ "$match_threshold" != "$_orig_match_threshold" ]]
 }
 
 do_settings() {
     local settings_sel=0
-    local settings_count=5
+    local settings_page=1
+    local page1_count=4   # View Mode, Display Mode, Sort Mode, Demo Mode
+    local page2_count=3   # Title Persistence, Auto-launch Claude, Match Threshold
     _settings_status=""
     _settings_status_color=""
 
@@ -2984,47 +3103,72 @@ do_settings() {
     local _orig_sort_mode="$sort_mode"
     local _orig_title_mode="$title_mode"
     local _orig_auto_claude="$auto_claude"
+    local _orig_demo_mode="$demo_mode"
+    local _orig_match_threshold="$match_threshold"
 
     while true; do
-        _draw_settings "$settings_sel"
+        local cur_count=$page1_count
+        (( settings_page == 2 )) && cur_count=$page2_count
+
+        _draw_settings "$settings_sel" "$settings_page"
         local key
         key=$(read_key) || break
         case "$key" in
             $'\e[A'|k) (( settings_sel > 0 )) && (( settings_sel-- )); _settings_status="" ;;
-            $'\e[B'|j) (( settings_sel < settings_count - 1 )) && (( settings_sel++ )) || true; _settings_status="" ;;
+            $'\e[B'|j) (( settings_sel < cur_count - 1 )) && (( settings_sel++ )) || true; _settings_status="" ;;
+            $'\t')
+                # Tab switches page
+                if (( settings_page == 1 )); then
+                    settings_page=2
+                else
+                    settings_page=1
+                fi
+                settings_sel=0
+                _settings_status=""
+                ;;
             $'\e[C'|l)
                 _settings_status=""
-                case "$settings_sel" in
-                    0) view_mode=$(_cycle_value "$view_mode" 1 local all) ;;
-                    1) display_mode=$(_cycle_value "$display_mode" 1 compact full grid) ;;
-                    2) sort_mode=$(_cycle_value "$sort_mode" 1 date recent name language) ;;
-                    3)
-                        title_mode=$(_cycle_value "$title_mode" 1 none window_title tmux_split tmux_status scroll_region prompt)
-                        if ! _has_tmux; then
-                            case "$title_mode" in
-                                tmux_split|tmux_status) _install_tmux ;;
-                            esac
-                        fi
-                        ;;
-                    4) auto_claude=$(_cycle_value "$auto_claude" 1 on off) ;;
-                esac
+                if (( settings_page == 1 )); then
+                    case "$settings_sel" in
+                        0) view_mode=$(_cycle_value "$view_mode" 1 local all) ;;
+                        1) display_mode=$(_cycle_value "$display_mode" 1 compact full grid) ;;
+                        2) sort_mode=$(_cycle_value "$sort_mode" 1 date recent name language) ;;
+                        3) demo_mode=$(_cycle_value "$demo_mode" 1 off on) ;;
+                    esac
+                else
+                    case "$settings_sel" in
+                        0)
+                            title_mode=$(_cycle_value "$title_mode" 1 none window_title tmux_split tmux_status scroll_region prompt)
+                            if ! _has_tmux; then
+                                case "$title_mode" in tmux_split|tmux_status) _install_tmux ;; esac
+                            fi
+                            ;;
+                        1) auto_claude=$(_cycle_value "$auto_claude" 1 on off) ;;
+                        2) (( match_threshold < 100 )) && (( match_threshold += 5 )) ;;
+                    esac
+                fi
                 ;;
             $'\e[D'|h)
                 _settings_status=""
-                case "$settings_sel" in
-                    0) view_mode=$(_cycle_value "$view_mode" -1 local all) ;;
-                    1) display_mode=$(_cycle_value "$display_mode" -1 compact full grid) ;;
-                    2) sort_mode=$(_cycle_value "$sort_mode" -1 date recent name language) ;;
-                    3)
-                        title_mode=$(_cycle_value "$title_mode" -1 none window_title tmux_split tmux_status scroll_region prompt)
-                        if ! _has_tmux; then
-                            case "$title_mode" in
-                                tmux_split|tmux_status) _install_tmux ;;
-                            esac
-                        fi
-                        ;;
-                    4) auto_claude=$(_cycle_value "$auto_claude" -1 on off) ;;
-                esac
+                if (( settings_page == 1 )); then
+                    case "$settings_sel" in
+                        0) view_mode=$(_cycle_value "$view_mode" -1 local all) ;;
+                        1) display_mode=$(_cycle_value "$display_mode" -1 compact full grid) ;;
+                        2) sort_mode=$(_cycle_value "$sort_mode" -1 date recent name language) ;;
+                        3) demo_mode=$(_cycle_value "$demo_mode" -1 off on) ;;
+                    esac
+                else
+                    case "$settings_sel" in
+                        0)
+                            title_mode=$(_cycle_value "$title_mode" -1 none window_title tmux_split tmux_status scroll_region prompt)
+                            if ! _has_tmux; then
+                                case "$title_mode" in tmux_split|tmux_status) _install_tmux ;; esac
+                            fi
+                            ;;
+                        1) auto_claude=$(_cycle_value "$auto_claude" -1 on off) ;;
+                        2) (( match_threshold > 0 )) && (( match_threshold -= 5 )) ;;
+                    esac
+                fi
                 ;;
             "")
                 # Enter = save and exit
@@ -3034,15 +3178,14 @@ do_settings() {
                 break
                 ;;
             i|I)
-                if (( settings_sel == 3 )) && ! _has_tmux; then
+                if (( settings_page == 2 && settings_sel == 0 )) && ! _has_tmux; then
                     _install_tmux
                 fi
                 ;;
-            x|X) _export_prefs ;;
-            m|M) _import_prefs ;;
+            x|X) (( settings_page == 2 )) && _export_prefs ;;
+            m|M) (( settings_page == 2 )) && _import_prefs ;;
             q|$'\x1b')
                 if _settings_has_changes; then
-                    # Confirm discard
                     local term_lines
                     term_lines=$(tput_lines)
                     move_to "$term_lines" 1
@@ -3051,17 +3194,17 @@ do_settings() {
                     local answer
                     IFS= read -rsn1 answer < /dev/tty
                     if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
-                        # Restore originals
                         view_mode="$_orig_view_mode"
                         display_mode="$_orig_display_mode"
                         sort_mode="$_orig_sort_mode"
                         title_mode="$_orig_title_mode"
                         auto_claude="$_orig_auto_claude"
+                        demo_mode="$_orig_demo_mode"
+                        match_threshold="$_orig_match_threshold"
                         status_msg="Settings discarded"
                         status_color="${byellow}${bold}"
                         break
                     fi
-                    # N or other key = stay in settings
                 else
                     break
                 fi
@@ -3071,6 +3214,7 @@ do_settings() {
     # Reload dirs if view mode may have changed
     load_dirs
     _apply_groups_to_cache
+    _apply_demo_mode
 }
 
 do_new()   { action="new"; }
@@ -3184,6 +3328,7 @@ main() {
     _start_spinner
     load_dirs
     _apply_groups_to_cache
+    _apply_demo_mode
     _stop_spinner
 
     # Handle CLI argument: quick-open or pre-fill search
