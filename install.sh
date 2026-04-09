@@ -146,7 +146,7 @@ main() {
 # TUI for managing Claude Code project directories.
 # Opens a project picker; selecting a project cd's into it and optionally runs claude.
 _cm_launch_claude() {
-    local title="\$1" mode="\$2"
+    local title="\$1" mode="\$2" agent_cmd="\${3:-claude}"
 
     # Always set the terminal window/tab title (non-intrusive, works everywhere)
     if [[ -n "\$title" ]]; then
@@ -159,7 +159,7 @@ _cm_launch_claude() {
                 printf '\\e[33mtmux is not installed. Falling back to window/tab title.\\e[0m\\n'
                 printf '\\e[2mPress , in claudemanager to open settings and install tmux.\\e[0m\\n'
                 sleep 2
-                claude
+                \$agent_cmd
             else
                 local sess="cm_\$\$"
                 # If already in tmux, allow nesting
@@ -168,7 +168,7 @@ _cm_launch_claude() {
                 tmux new-session -d -s "\$sess" -x "\$(tput cols)" -y "\$(tput lines)"
                 tmux split-window -v -b -l 2 -t "\$sess"
                 tmux send-keys -t "\$sess:0.0" "printf '\\\\e[44;1;37m  %-*s\\\\e[0m' \$(tput cols) '  \$title'; exec cat" Enter
-                tmux send-keys -t "\$sess:0.1" "claude; tmux kill-session -t \$sess 2>/dev/null" Enter
+                tmux send-keys -t "\$sess:0.1" "\$agent_cmd; tmux kill-session -t \$sess 2>/dev/null" Enter
                 tmux set -t "\$sess" status off
                 tmux attach -t "\$sess"
                 [[ -n "\$old_tmux" ]] && export TMUX="\$old_tmux"
@@ -179,16 +179,16 @@ _cm_launch_claude() {
                 printf '\\e[33mtmux is not installed. Falling back to window/tab title.\\e[0m\\n'
                 printf '\\e[2mPress , in claudemanager to open settings and install tmux.\\e[0m\\n'
                 sleep 2
-                claude
+                \$agent_cmd
             elif [[ -n "\${TMUX:-}" ]]; then
                 local old_status
                 old_status=\$(tmux show-option -gqv status-left)
                 tmux set -g status-left "#[bg=blue,fg=white,bold]  \$title  #[default] "
-                claude
+                \$agent_cmd
                 tmux set -g status-left "\$old_status"
             else
                 # Not in tmux, window/tab title already set above
-                claude
+                \$agent_cmd
             fi
             ;;
         scroll_region)
@@ -197,11 +197,11 @@ _cm_launch_claude() {
             printf '\\e[1;1H\\e[44;1;37m  %-*s\\e[0m' "\$cols" "  \$title"
             printf '\\e[2;%dr' "\$lines"
             printf '\\e[2;1H'
-            claude
+            \$agent_cmd
             printf '\\e[r'
             ;;
         prompt)
-            claude
+            \$agent_cmd
             if [[ -n "\${BASH_VERSION:-}" ]]; then
                 PROMPT_COMMAND="printf '\\e[44;1;37m  %-*s\\e[0m\\n' \$(tput cols) '  \$title'; \${PROMPT_COMMAND:-}"
             elif [[ -n "\${ZSH_VERSION:-}" ]]; then
@@ -210,7 +210,7 @@ _cm_launch_claude() {
             ;;
         window_title|none|*)
             # window/tab title already set above, just run claude
-            claude
+            \$agent_cmd
             ;;
     esac
 
@@ -220,10 +220,17 @@ _cm_launch_claude() {
     fi
 }
 claudemanager() {
+    # Pass subcommands (--install, --refresh, etc.) directly — no tmpfile needed
+    case "\${1:-}" in
+        --install|--refresh)
+            "${INSTALL_DIR}/claudemanager.sh" "\$@"
+            return
+            ;;
+    esac
     local tmpfile
     tmpfile=\$(mktemp /tmp/claudemanager.XXXXXX)
     CLAUDEMANAGER_RESULT="\$tmpfile" "${INSTALL_DIR}/claudemanager.sh" "\$@"
-    local dir="" run_claude=false title="" title_mode="none"
+    local dir="" run_claude=false title="" title_mode="none" agent_cmd="claude"
     if [[ -f "\$tmpfile" ]]; then
         while IFS= read -r line; do
             case "\$line" in
@@ -236,6 +243,9 @@ claudemanager() {
                 __CLAUDE_TITLE__:*)
                     title="\${line#__CLAUDE_TITLE__:}"
                     ;;
+                __AGENT_CMD__:*)
+                    agent_cmd="\${line#__AGENT_CMD__:}"
+                    ;;
                 __CLAUDE_TITLE_MODE__:*)
                     title_mode="\${line#__CLAUDE_TITLE_MODE__:}"
                     ;;
@@ -246,7 +256,7 @@ claudemanager() {
     if [[ -n "\$dir" ]]; then
         cd "\$dir" || return 1
         if \$run_claude; then
-            _cm_launch_claude "\$title" "\$title_mode"
+            _cm_launch_claude "\$title" "\$title_mode" "\$agent_cmd"
         fi
     fi
 }

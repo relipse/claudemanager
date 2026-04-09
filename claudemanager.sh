@@ -2,6 +2,12 @@
 # claudemanager - Colorful TUI for managing Claude project directories
 # Copyright (C) 2026 Kinsman Software LLC. All rights reserved.
 # All TUI I/O goes through /dev/tty so the wrapper function can capture stdout signals.
+#
+# Usage:
+#   claudemanager              — open the TUI
+#   claudemanager --install    — install/update the shell wrapper function
+#   claudemanager --refresh    — re-write the shell wrapper (after an update)
+#   claudemanager <query>      — quick-open a project matching <query>
 
 set -uo pipefail
 
@@ -65,6 +71,8 @@ selected=0
 scroll_offset=0
 action=""
 open_dir=""
+open_agent_override=""
+open_force_run=false
 status_msg=""
 status_color="$green"
 search_query=""
@@ -73,6 +81,7 @@ view_mode="local"      # local | all
 display_mode="compact"  # compact | full | grid
 title_mode="scroll_region" # none | window_title | tmux_split | tmux_status | scroll_region | prompt
 auto_claude="on"       # on | off
+agent="claude"         # AI agent to launch: claude opencode copilot amp cursor-agent aider gemini codex
 match_threshold=95     # 0-100, minimum similarity % for quick-open
 demo_mode="off"        # off | on — anonymize project names/paths for screenshots
 
@@ -87,6 +96,7 @@ _load_prefs() {
             sort_mode)    sort_mode="$val" ;;
             title_mode)   title_mode="$val" ;;
             auto_claude)      auto_claude="$val" ;;
+            agent)            agent="$val" ;;
             match_threshold)  match_threshold="$val" ;;
             demo_mode)        demo_mode="$val" ;;
         esac
@@ -94,8 +104,8 @@ _load_prefs() {
 }
 
 _save_prefs() {
-    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\ndemo_mode=%s\n' \
-        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" "$demo_mode" > "$PREFS_FILE"
+    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\ndemo_mode=%s\nagent=%s\n' \
+        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" "$demo_mode" "$agent" > "$PREFS_FILE"
 }
 
 _load_prefs
@@ -1065,6 +1075,7 @@ draw() {
     move_to 2 1
     tui '  '
     tui '%s enter %s open  '    "${bg_gray}${bwhite}${bold}"   "${reset}${dim}"
+    tui '%s A %s open with  '   "${bg_magenta}${white}${bold}" "${reset}${dim}"
     tui '%s / %s search  '      "${bg_bblue}${white}${bold}"   "${reset}${dim}"
     tui '%s n %s new  '         "${bg_green}${black}${bold}"    "${reset}${dim}"
     tui '%s p %s all  '         "${bg_cyan}${black}${bold}"     "${reset}${dim}"
@@ -3003,13 +3014,20 @@ _draw_settings() {
             (( row += 2 ))
         fi
 
-        # 1: Auto-launch Claude
-        _draw_setting_row "$row" "$(( sel == 1 ))" "Auto-launch Claude" "$auto_claude" \
-            "on = run claude on open  |  off = just cd into directory"
+        # 1: AI Agent
+        local _agent_display="$agent"
+        command -v "$agent" &>/dev/null || _agent_display="${agent} ${bred}(not found)${reset}"
+        _draw_setting_row "$row" "$(( sel == 1 ))" "AI Agent" "$_agent_display" \
+            "claude  opencode  copilot  amp  cursor-agent  aider  gemini  codex"
         (( row += (sel == 1 ? 3 : 2) ))
 
-        # 2: Match Threshold
-        _draw_setting_row "$row" "$(( sel == 2 ))" "Quick-open Threshold" "${match_threshold}%" \
+        # 2: Auto-launch Agent
+        _draw_setting_row "$row" "$(( sel == 2 ))" "Auto-launch Agent" "$auto_claude" \
+            "on = run agent on open  |  off = just cd into directory"
+        (( row += (sel == 2 ? 3 : 2) ))
+
+        # 3: Match Threshold
+        _draw_setting_row "$row" "$(( sel == 3 ))" "Quick-open Threshold" "${match_threshold}%" \
             "Minimum similarity % for instant open (0-100, higher = stricter)"
     fi
 
@@ -3050,6 +3068,7 @@ _export_prefs() {
         printf 'sort_mode=%s\n' "$sort_mode"
         printf 'title_mode=%s\n' "$title_mode"
         printf 'auto_claude=%s\n' "$auto_claude"
+        printf 'agent=%s\n' "$agent"
     } > "$export_path"
     _settings_status="Exported to $export_path"
     _settings_status_color="${bgreen}${bold}"
@@ -3073,6 +3092,7 @@ _import_prefs() {
             sort_mode)    sort_mode="$val" ;;
             title_mode)   title_mode="$val" ;;
             auto_claude)  auto_claude="$val" ;;
+            agent)        agent="$val" ;;
         esac
     done < "$import_path"
     _settings_status="Imported from $import_path"
@@ -3085,6 +3105,7 @@ _settings_has_changes() {
     [[ "$sort_mode" != "$_orig_sort_mode" ]] || \
     [[ "$title_mode" != "$_orig_title_mode" ]] || \
     [[ "$auto_claude" != "$_orig_auto_claude" ]] || \
+    [[ "$agent" != "$_orig_agent" ]] || \
     [[ "$demo_mode" != "$_orig_demo_mode" ]] || \
     [[ "$match_threshold" != "$_orig_match_threshold" ]]
 }
@@ -3093,7 +3114,7 @@ do_settings() {
     local settings_sel=0
     local settings_page=1
     local page1_count=4   # View Mode, Display Mode, Sort Mode, Demo Mode
-    local page2_count=3   # Title Persistence, Auto-launch Claude, Match Threshold
+    local page2_count=4   # Title Persistence, AI Agent, Auto-launch Agent, Match Threshold
     _settings_status=""
     _settings_status_color=""
 
@@ -3103,6 +3124,7 @@ do_settings() {
     local _orig_sort_mode="$sort_mode"
     local _orig_title_mode="$title_mode"
     local _orig_auto_claude="$auto_claude"
+    local _orig_agent="$agent"
     local _orig_demo_mode="$demo_mode"
     local _orig_match_threshold="$match_threshold"
 
@@ -3143,8 +3165,9 @@ do_settings() {
                                 case "$title_mode" in tmux_split|tmux_status) _install_tmux ;; esac
                             fi
                             ;;
-                        1) auto_claude=$(_cycle_value "$auto_claude" 1 on off) ;;
-                        2) (( match_threshold < 100 )) && (( match_threshold += 5 )) ;;
+                        1) agent=$(_cycle_value "$agent" 1 claude opencode copilot amp cursor-agent aider gemini codex) ;;
+                        2) auto_claude=$(_cycle_value "$auto_claude" 1 on off) ;;
+                        3) (( match_threshold < 100 )) && (( match_threshold += 5 )) ;;
                     esac
                 fi
                 ;;
@@ -3165,8 +3188,9 @@ do_settings() {
                                 case "$title_mode" in tmux_split|tmux_status) _install_tmux ;; esac
                             fi
                             ;;
-                        1) auto_claude=$(_cycle_value "$auto_claude" -1 on off) ;;
-                        2) (( match_threshold > 0 )) && (( match_threshold -= 5 )) ;;
+                        1) agent=$(_cycle_value "$agent" -1 claude opencode copilot amp cursor-agent aider gemini codex) ;;
+                        2) auto_claude=$(_cycle_value "$auto_claude" -1 on off) ;;
+                        3) (( match_threshold > 0 )) && (( match_threshold -= 5 )) ;;
                     esac
                 fi
                 ;;
@@ -3199,6 +3223,7 @@ do_settings() {
                         sort_mode="$_orig_sort_mode"
                         title_mode="$_orig_title_mode"
                         auto_claude="$_orig_auto_claude"
+                        agent="$_orig_agent"
                         demo_mode="$_orig_demo_mode"
                         match_threshold="$_orig_match_threshold"
                         status_msg="Settings discarded"
@@ -3231,6 +3256,69 @@ do_shell() {
     open_dir="${dirs[$idx]}"
     _record_open "$open_dir"
     action="shell"
+}
+
+do_open_with() {
+    (( ${#filtered[@]} == 0 )) && return
+    local idx="${filtered[$selected]}"
+    local title="${cache_title[$idx]}"
+    local -a known_agents=(claude opencode copilot amp cursor-agent aider gemini codex)
+
+    local sel=0
+    local count=${#known_agents[@]}
+    # Pre-select current default agent
+    for (( i=0; i<count; i++ )); do
+        [[ "${known_agents[$i]}" == "$agent" ]] && sel=$i && break
+    done
+
+    while true; do
+        clear_screen
+        local term_lines term_cols
+        term_lines=$(tput_lines)
+        term_cols=$(tput_cols)
+        local row=2
+        move_to "$row" 1
+        tui '  %sOpen in agent:%s  %s%s%s' "${bold}${bwhite}" "${reset}" "${bold}${bcyan}" "$title" "${reset}"
+        (( row += 2 ))
+
+        for (( i=0; i<count; i++ )); do
+            move_to "$row" 1
+            local a="${known_agents[$i]}"
+            local suffix=""
+            command -v "$a" &>/dev/null || suffix="${dim}  (not installed)${reset}"
+            [[ "$a" == "$agent" ]] && suffix+="${dim}  [default]${reset}"
+            if (( i == sel )); then
+                tui '  %s> %s%s%s%s' "${bgreen}${bold}" "${bg_sel}${bwhite}${bold}" "$a" "${reset}" "$suffix"
+            else
+                if command -v "$a" &>/dev/null; then
+                    tui '    %s%s%s%s' "${bwhite}" "$a" "${reset}" "$suffix"
+                else
+                    tui '    %s%s%s%s' "${dim}" "$a" "${reset}" "$suffix"
+                fi
+            fi
+            (( row++ ))
+        done
+
+        move_to "$term_lines" 1
+        tui '  %sj/k%s navigate  %senter%s open  %sq%s cancel' \
+            "${bwhite}${bold}" "${reset}${dim}" \
+            "${bwhite}${bold}" "${reset}${dim}" \
+            "${bwhite}${bold}" "${reset}"
+
+        local key
+        key=$(read_key)
+        case "$key" in
+            $'\e[A' | k) (( sel > 0 )) && (( sel-- )) ;;
+            $'\e[B' | j) (( sel < count - 1 )) && (( sel++ )) ;;
+            "")
+                open_agent_override="${known_agents[$sel]}"
+                open_force_run=true
+                do_open
+                return
+                ;;
+            q | $'\x1b') return ;;
+        esac
+    done
 }
 
 # ── Fuzzy match (Levenshtein via awk) ─────────────────────────────
@@ -3324,7 +3412,233 @@ _stop_spinner() {
     fi
 }
 
+# ── Self-install / refresh ────────────────────────────────────────
+
+_install_detect_profile() {
+    local shell_name
+    shell_name=$(basename "${SHELL:-bash}")
+    case "$shell_name" in
+        zsh)
+            [[ -f "$HOME/.zshrc" ]] && echo "$HOME/.zshrc" || echo "$HOME/.zprofile" ;;
+        bash)
+            if [[ -f "$HOME/.bashrc" ]]; then echo "$HOME/.bashrc"
+            elif [[ -f "$HOME/.bash_profile" ]]; then echo "$HOME/.bash_profile"
+            else echo "$HOME/.profile"; fi ;;
+        *) echo "$HOME/.profile" ;;
+    esac
+}
+
+_install_remove_old_wrapper() {
+    local profile="$1"
+    if grep -q 'claudemanager()' "$profile" 2>/dev/null || \
+       grep -q '_cm_launch_claude()' "$profile" 2>/dev/null; then
+        sed -i.bak '/# ── claudemanager ──/,/# ── \/claudemanager ──/d' "$profile"
+        rm -f "${profile}.bak"
+        local tmpprofile
+        tmpprofile=$(mktemp "${profile}.XXXXXX")
+        awk '
+            /^_cm_launch_claude\(\)/ || /^claudemanager\(\)/ { skip=1; brace=0; next }
+            skip && /\{/ { brace++ }
+            skip && /^\}/ { brace--; if (brace <= 0) { skip=0 }; next }
+            skip { next }
+            !skip { print }
+        ' "$profile" > "$tmpprofile" && mv "$tmpprofile" "$profile" || rm -f "$tmpprofile"
+    fi
+}
+
+_install_write_wrapper() {
+    local install_dir="$1" profile="$2"
+    cat >> "$profile" << WRAPPER
+
+# ── claudemanager ─────────────────────────────────────────────────
+# TUI for managing Claude Code project directories.
+# Opens a project picker; selecting a project cd's into it and optionally runs an AI agent.
+_cm_launch_claude() {
+    local title="\$1" mode="\$2" agent_cmd="\${3:-claude}"
+
+    # Always set the terminal window/tab title (non-intrusive, works everywhere)
+    if [[ -n "\$title" ]]; then
+        printf '\\e]0;claudemanager: %s\\a' "\$title"
+    fi
+
+    case "\$mode" in
+        tmux_split)
+            if ! command -v tmux &>/dev/null; then
+                printf '\\e[33mtmux is not installed. Falling back to window/tab title.\\e[0m\\n'
+                printf '\\e[2mPress , in claudemanager to open settings and install tmux.\\e[0m\\n'
+                sleep 2
+                \$agent_cmd
+            else
+                local sess="cm_\$\$"
+                local old_tmux="\${TMUX:-}"
+                unset TMUX
+                tmux new-session -d -s "\$sess" -x "\$(tput cols)" -y "\$(tput lines)"
+                tmux split-window -v -b -l 2 -t "\$sess"
+                tmux send-keys -t "\$sess:0.0" "printf '\\\\e[44;1;37m  %-*s\\\\e[0m' \$(tput cols) '  \$title'; exec cat" Enter
+                tmux send-keys -t "\$sess:0.1" "\$agent_cmd; tmux kill-session -t \$sess 2>/dev/null" Enter
+                tmux set -t "\$sess" status off
+                tmux attach -t "\$sess"
+                [[ -n "\$old_tmux" ]] && export TMUX="\$old_tmux"
+            fi
+            ;;
+        tmux_status)
+            if ! command -v tmux &>/dev/null; then
+                printf '\\e[33mtmux is not installed. Falling back to window/tab title.\\e[0m\\n'
+                printf '\\e[2mPress , in claudemanager to open settings and install tmux.\\e[0m\\n'
+                sleep 2
+                \$agent_cmd
+            elif [[ -n "\${TMUX:-}" ]]; then
+                local old_status
+                old_status=\$(tmux show-option -gqv status-left)
+                tmux set -g status-left "#[bg=blue,fg=white,bold]  \$title  #[default] "
+                \$agent_cmd
+                tmux set -g status-left "\$old_status"
+            else
+                \$agent_cmd
+            fi
+            ;;
+        scroll_region)
+            local lines=\$(tput lines)
+            local cols=\$(tput cols)
+            printf '\\e[1;1H\\e[44;1;37m  %-*s\\e[0m' "\$cols" "  \$title"
+            printf '\\e[2;%dr' "\$lines"
+            printf '\\e[2;1H'
+            \$agent_cmd
+            printf '\\e[r'
+            ;;
+        prompt)
+            \$agent_cmd
+            if [[ -n "\${BASH_VERSION:-}" ]]; then
+                PROMPT_COMMAND="printf '\\e[44;1;37m  %-*s\\e[0m\\n' \$(tput cols) '  \$title'; \${PROMPT_COMMAND:-}"
+            elif [[ -n "\${ZSH_VERSION:-}" ]]; then
+                precmd() { printf '\\e[44;1;37m  %-*s\\e[0m\\n' "\$(tput cols)" "  \$title"; }
+            fi
+            ;;
+        window_title|none|*)
+            \$agent_cmd
+            ;;
+    esac
+
+    if [[ -n "\$title" ]]; then
+        printf '\\e]0;%s\\a' "\${TERM_PROGRAM:-Terminal}"
+    fi
+}
+claudemanager() {
+    # Pass subcommands (--install, --refresh, etc.) directly — no tmpfile needed
+    case "\${1:-}" in
+        --install|--refresh)
+            "${install_dir}/claudemanager.sh" "\$@"
+            return
+            ;;
+    esac
+    local tmpfile
+    tmpfile=\$(mktemp /tmp/claudemanager.XXXXXX)
+    CLAUDEMANAGER_RESULT="\$tmpfile" "${install_dir}/claudemanager.sh" "\$@"
+    local dir="" run_claude=false title="" title_mode="none" agent_cmd="claude"
+    if [[ -f "\$tmpfile" ]]; then
+        while IFS= read -r line; do
+            case "\$line" in
+                __CLAUDE_CD__:*)      dir="\${line#__CLAUDE_CD__:}" ;;
+                __CLAUDE_RUN__)       run_claude=true ;;
+                __CLAUDE_TITLE__:*)   title="\${line#__CLAUDE_TITLE__:}" ;;
+                __AGENT_CMD__:*)      agent_cmd="\${line#__AGENT_CMD__:}" ;;
+                __CLAUDE_TITLE_MODE__:*) title_mode="\${line#__CLAUDE_TITLE_MODE__:}" ;;
+            esac
+        done < "\$tmpfile"
+        rm -f "\$tmpfile"
+    fi
+    if [[ -n "\$dir" ]]; then
+        cd "\$dir" || return 1
+        if \$run_claude; then
+            _cm_launch_claude "\$title" "\$title_mode" "\$agent_cmd"
+        fi
+    fi
+}
+# ── /claudemanager ──
+WRAPPER
+}
+
+cmd_install() {
+    local install_dir="${CLAUDEMANAGER_HOME:-$HOME/.claudemanager}"
+    local self
+    self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+    local _green=$'\e[32m' _cyan=$'\e[36m' _yellow=$'\e[33m' _bold=$'\e[1m' _dim=$'\e[2m' _rst=$'\e[0m'
+    _ci_info()  { printf '%s[info]%s  %s\n' "${_cyan}${_bold}" "${_rst}" "$*"; }
+    _ci_ok()    { printf '%s[ok]%s    %s\n' "${_green}${_bold}" "${_rst}" "$*"; }
+
+    printf '\n%s  C L A U D E   M A N A G E R   I N S T A L L E R%s\n' "${_bold}${_cyan}" "${_rst}"
+    printf '  %sKinsman Software LLC%s\n\n' "${_dim}" "${_rst}"
+
+    # 1. Create install dir
+    [[ -d "$install_dir" ]] || { _ci_info "Creating $install_dir"; mkdir -p "$install_dir"; }
+    _ci_ok "Install directory: $install_dir"
+
+    # 2. Copy self to install dir (unless already running from there)
+    local target="$install_dir/claudemanager.sh"
+    if [[ "$(realpath "$self" 2>/dev/null || echo "$self")" != \
+          "$(realpath "$target" 2>/dev/null || echo "$target")" ]]; then
+        _ci_info "Installing to $target"
+        cp "$self" "$target"
+        chmod +x "$target"
+    fi
+    _ci_ok "Installed claudemanager.sh → $target"
+
+    # 3. Detect Claude projects
+    local claude_projects_dir="$HOME/.claude/projects"
+    if [[ -d "$claude_projects_dir" ]]; then
+        local project_count
+        project_count=$(find "$claude_projects_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+        _ci_ok "Found $project_count projects in Claude history (~/.claude/projects)"
+    fi
+
+    # 4. Shell wrapper
+    local profile
+    profile=$(_install_detect_profile)
+    if grep -q 'claudemanager()' "$profile" 2>/dev/null || \
+       grep -q '_cm_launch_claude()' "$profile" 2>/dev/null; then
+        _ci_info "Updating existing wrapper in $profile"
+    else
+        _ci_info "Adding shell function to $profile"
+    fi
+    _install_remove_old_wrapper "$profile"
+    _install_write_wrapper "$install_dir" "$profile"
+    _ci_ok "Shell wrapper written to $profile"
+
+    # 5. CLAUDE_BASE if custom
+    if [[ "${CLAUDE_BASE:-$install_dir}" != "$install_dir" ]]; then
+        if ! grep -q 'export CLAUDE_BASE=' "$profile" 2>/dev/null; then
+            printf '\nexport CLAUDE_BASE="%s"\n' "$CLAUDE_BASE" >> "$profile"
+            _ci_ok "Set CLAUDE_BASE=$CLAUDE_BASE in $profile"
+        fi
+    fi
+
+    printf '\n%s  Done!%s\n' "${_bold}${_green}" "${_rst}"
+    printf '  Restart your shell or run: %ssource %s%s\n' "${_dim}" "$profile" "${_rst}"
+    printf '  Then type: %sclaudemanager%s\n\n' "${_bold}" "${_rst}"
+}
+
+cmd_refresh() {
+    local install_dir="${CLAUDEMANAGER_HOME:-$HOME/.claudemanager}"
+    local _green=$'\e[32m' _cyan=$'\e[36m' _bold=$'\e[1m' _dim=$'\e[2m' _rst=$'\e[0m'
+
+    local profile
+    profile=$(_install_detect_profile)
+
+    printf '\n%s  Refreshing shell wrapper...%s\n\n' "${_bold}${_cyan}" "${_rst}"
+    _install_remove_old_wrapper "$profile"
+    _install_write_wrapper "$install_dir" "$profile"
+    printf '%s[ok]%s    Shell wrapper updated in %s\n' "${_green}${_bold}" "${_rst}" "$profile"
+    printf '  Run: %ssource %s%s\n\n' "${_dim}" "$profile" "${_rst}"
+}
+
 main() {
+    # Handle install/refresh subcommands before TUI init
+    case "${1:-}" in
+        --install) cmd_install; return ;;
+        --refresh) cmd_refresh; return ;;
+    esac
+
     _start_spinner
     load_dirs
     _apply_groups_to_cache
@@ -3341,6 +3655,7 @@ main() {
                 local idx="${filtered[$selected]}"
                 printf '__CLAUDE_CD__:%s\n' "$open_dir" > "$result_file"
                 [[ "$auto_claude" == "on" ]] && printf '__CLAUDE_RUN__\n' >> "$result_file"
+                printf '__AGENT_CMD__:%s\n' "${open_agent_override:-$agent}" >> "$result_file"
                 printf '__CLAUDE_TITLE__:%s\n' "${cache_title[$idx]}" >> "$result_file"
                 printf '__CLAUDE_TITLE_MODE__:%s\n' "$title_mode" >> "$result_file"
             fi
@@ -3405,6 +3720,7 @@ main() {
             e)            do_edit_desc ;;
             d)            do_delete ;;
             s)            do_shell ;;
+            A)            do_open_with ;;
             c)            do_toggle_compact ;;
             p)            do_toggle_view ;;
             t)            do_toggle_sort ;;
@@ -3430,8 +3746,10 @@ main() {
         case "$action" in
             open)
                 local idx="${filtered[$selected]}"
+                local _effective_agent="${open_agent_override:-$agent}"
                 printf '__CLAUDE_CD__:%s\n' "$open_dir" > "$result_file"
-                [[ "$auto_claude" == "on" ]] && printf '__CLAUDE_RUN__\n' >> "$result_file"
+                { [[ "$auto_claude" == "on" ]] || $open_force_run; } && printf '__CLAUDE_RUN__\n' >> "$result_file"
+                printf '__AGENT_CMD__:%s\n' "$_effective_agent" >> "$result_file"
                 printf '__CLAUDE_TITLE__:%s\n' "${cache_title[$idx]}" >> "$result_file"
                 printf '__CLAUDE_TITLE_MODE__:%s\n' "$title_mode" >> "$result_file"
                 ;;
@@ -3443,6 +3761,7 @@ main() {
                 mkdir -p "$new_dir"
                 printf '__CLAUDE_CD__:%s\n' "$new_dir" > "$result_file"
                 [[ "$auto_claude" == "on" ]] && printf '__CLAUDE_RUN__\n' >> "$result_file"
+                printf '__AGENT_CMD__:%s\n' "$agent" >> "$result_file"
                 printf '__CLAUDE_TITLE__:%s\n' "$(basename "$new_dir")" >> "$result_file"
                 printf '__CLAUDE_TITLE_MODE__:%s\n' "$title_mode" >> "$result_file"
                 ;;
