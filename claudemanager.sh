@@ -3258,6 +3258,20 @@ do_shell() {
     action="shell"
 }
 
+_agent_install_hint() {
+    case "$1" in
+        claude)       echo "npm install -g @anthropic-ai/claude-code" ;;
+        opencode)     echo "curl -fsSL https://opencode.ai/install | sh" ;;
+        copilot)      echo "gh extension install github/gh-copilot" ;;
+        amp)          echo "curl -fsSL https://ampcode.com/install | sh" ;;
+        cursor-agent) echo "Install Cursor IDE from cursor.com" ;;
+        aider)        echo "pipx install aider-chat  (or: pip install aider-chat)" ;;
+        gemini)       echo "npm install -g @google/gemini-cli" ;;
+        codex)        echo "npm install -g @openai/codex" ;;
+        *)            echo "see the project's documentation" ;;
+    esac
+}
+
 do_open_with() {
     (( ${#filtered[@]} == 0 )) && return
     local idx="${filtered[$selected]}"
@@ -3285,7 +3299,7 @@ do_open_with() {
             move_to "$row" 1
             local a="${known_agents[$i]}"
             local suffix=""
-            command -v "$a" &>/dev/null || suffix="${dim}  (not installed)${reset}"
+            command -v "$a" &>/dev/null || suffix="${bred}  (not installed)${reset}"
             [[ "$a" == "$agent" ]] && suffix+="${dim}  [default]${reset}"
             if (( i == sel )); then
                 tui '  %s> %s%s%s%s' "${bgreen}${bold}" "${bg_sel}${bwhite}${bold}" "$a" "${reset}" "$suffix"
@@ -3311,7 +3325,24 @@ do_open_with() {
             $'\e[A' | k) (( sel > 0 )) && (( sel-- )) ;;
             $'\e[B' | j) (( sel < count - 1 )) && (( sel++ )) ;;
             "")
-                open_agent_override="${known_agents[$sel]}"
+                local chosen="${known_agents[$sel]}"
+                if ! command -v "$chosen" &>/dev/null; then
+                    # Show install hint — don't launch
+                    local hint
+                    hint=$(_agent_install_hint "$chosen")
+                    clear_screen
+                    move_to 2 1
+                    tui '  %s%s%s is not installed.\n' "${bold}${bred}" "$chosen" "${reset}"
+                    move_to 4 1
+                    tui '  %sInstall with:%s\n' "${bold}${bwhite}" "${reset}"
+                    move_to 5 1
+                    tui '    %s%s%s\n' "${bold}${byellow}" "$hint" "${reset}"
+                    move_to 7 1
+                    tui '  %sPress any key to go back...%s' "${dim}" "${reset}"
+                    read_key > /dev/null
+                    continue
+                fi
+                open_agent_override="$chosen"
                 open_force_run=true
                 do_open
                 return
@@ -3455,6 +3486,28 @@ _install_write_wrapper() {
 # Opens a project picker; selecting a project cd's into it and optionally runs an AI agent.
 _cm_launch_claude() {
     local title="\$1" mode="\$2" agent_cmd="\${3:-claude}"
+
+    # Guard: verify agent is installed before any terminal manipulation
+    if ! command -v "\$agent_cmd" &>/dev/null; then
+        printf '\\n\\e[31m[error]\\e[0m  Agent not found: %s\\n' "\$agent_cmd"
+        local _hint
+        case "\$agent_cmd" in
+            claude)       _hint="npm install -g @anthropic-ai/claude-code" ;;
+            opencode)     _hint="curl -fsSL https://opencode.ai/install | sh" ;;
+            copilot)      _hint="gh extension install github/gh-copilot" ;;
+            amp)          _hint="curl -fsSL https://ampcode.com/install | sh" ;;
+            cursor-agent) _hint="Install Cursor IDE from cursor.com" ;;
+            aider)        _hint="pipx install aider-chat" ;;
+            gemini)       _hint="npm install -g @google/gemini-cli" ;;
+            codex)        _hint="npm install -g @openai/codex" ;;
+            *)            _hint="see the project documentation" ;;
+        esac
+        printf '       Install:  %s\\n\\n' "\$_hint"
+        printf 'Press any key to continue... '
+        IFS= read -rsn1
+        printf '\\n'
+        return 1
+    fi
 
     # Always set the terminal window/tab title (non-intrusive, works everywhere)
     if [[ -n "\$title" ]]; then

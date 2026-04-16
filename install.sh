@@ -148,6 +148,28 @@ main() {
 _cm_launch_claude() {
     local title="\$1" mode="\$2" agent_cmd="\${3:-claude}"
 
+    # Guard: verify agent is installed before any terminal manipulation
+    if ! command -v "\$agent_cmd" &>/dev/null; then
+        printf '\\n\\e[31m[error]\\e[0m  Agent not found: %s\\n' "\$agent_cmd"
+        local _hint
+        case "\$agent_cmd" in
+            claude)       _hint="npm install -g @anthropic-ai/claude-code" ;;
+            opencode)     _hint="curl -fsSL https://opencode.ai/install | sh" ;;
+            copilot)      _hint="gh extension install github/gh-copilot" ;;
+            amp)          _hint="curl -fsSL https://ampcode.com/install | sh" ;;
+            cursor-agent) _hint="Install Cursor IDE from cursor.com" ;;
+            aider)        _hint="pipx install aider-chat" ;;
+            gemini)       _hint="npm install -g @google/gemini-cli" ;;
+            codex)        _hint="npm install -g @openai/codex" ;;
+            *)            _hint="see the project documentation" ;;
+        esac
+        printf '       Install:  %s\\n\\n' "\$_hint"
+        printf 'Press any key to continue... '
+        IFS= read -rsn1
+        printf '\\n'
+        return 1
+    fi
+
     # Always set the terminal window/tab title (non-intrusive, works everywhere)
     if [[ -n "\$title" ]]; then
         printf '\\e]0;claudemanager: %s\\a' "\$title"
