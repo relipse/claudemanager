@@ -14,8 +14,9 @@ set -uo pipefail
 CLAUDE_BASE="${CLAUDE_BASE:-$HOME/.claudemanager}"
 CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
 EXTRA_DIRS_FILE="$CLAUDE_BASE/.claudemanager_dirs"
+IGNORE_FILE="$CLAUDE_BASE/.claudemanager_ignore"
 CACHE_FILE="$CLAUDE_BASE/.claudemanager_cache"
-CACHE_SCHEMA="4"  # bump when _compute_title/_compute_* output format changes
+CACHE_SCHEMA="5"  # bump when _compute_title/_compute_* output format changes
 BUILD_DATE=$(stat -f '%Sm' -t '%Y-%m-%d' "${BASH_SOURCE[0]}" 2>/dev/null || date '+%Y-%m-%d')
 DIRLIST_CACHE="$CLAUDE_BASE/.claudemanager_dirlist"
 PREFS_FILE="$CLAUDE_BASE/.claudemanager_prefs"
@@ -832,9 +833,9 @@ _load_disk_cache() {
     if [[ "$_cache_schema" != "$CACHE_SCHEMA" ]]; then
         return 0
     fi
-    while IFS=$'\t' read -r c_path c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch c_recent; do
+    while IFS=$'\x1f' read -r c_path c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch c_recent; do
         [[ -z "$c_path" || "$c_path" == \#* ]] && continue
-        disk_cache["$c_path"]="${c_mtime}	${c_title}	${c_date}	${c_desc}	${c_files}	${c_lang}	${c_framework}	${c_epoch}	${c_recent:-0}"
+        disk_cache["$c_path"]="${c_mtime}"$'\x1f'"${c_title}"$'\x1f'"${c_date}"$'\x1f'"${c_desc}"$'\x1f'"${c_files}"$'\x1f'"${c_lang}"$'\x1f'"${c_framework}"$'\x1f'"${c_epoch}"$'\x1f'"${c_recent:-0}"
     done < "$CACHE_FILE"
 }
 
@@ -847,15 +848,15 @@ _save_disk_cache() {
             local d="${dirs[$i]}"
             local mtime="${cache_mtime[$i]:-}"
             [[ -z "$mtime" ]] && mtime=$(stat -f '%m' "$d" 2>/dev/null || echo "0")
-            local t="${cache_title[$i]//$'\t'/ }"
-            local dt="${cache_date[$i]//$'\t'/ }"
-            local ds="${cache_desc[$i]//$'\t'/ }"
+            local t="${cache_title[$i]//$'\x1f'/ }"
+            local dt="${cache_date[$i]//$'\x1f'/ }"
+            local ds="${cache_desc[$i]//$'\x1f'/ }"
             local f="${cache_files[$i]}"
             local l="${cache_lang[$i]}"
-            local fw="${cache_framework[$i]//$'\t'/ }"
+            local fw="${cache_framework[$i]//$'\x1f'/ }"
             local ep="${cache_epoch[$i]}"
             local rec="${cache_recent[$i]:-0}"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$mtime" "$t" "$dt" "$ds" "$f" "$l" "$fw" "$ep" "$rec"
+            printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$d" "$mtime" "$t" "$dt" "$ds" "$f" "$l" "$fw" "$ep" "$rec"
         done
     } > "$CACHE_FILE"
 }
@@ -876,7 +877,7 @@ _cache_one_dir() {
         local cached="${disk_cache[$d]:-}"
         if [[ -n "$cached" ]]; then
             local c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch c_recent
-            IFS=$'\t' read -r c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch c_recent <<< "$cached"
+            IFS=$'\x1f' read -r c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch c_recent <<< "$cached"
             if [[ "$_ts_dir" == "true" || "$c_mtime" == "$dir_mtime" ]]; then
                 cache_title+=("$c_title")
                 cache_date+=("$c_date")
@@ -1075,6 +1076,26 @@ load_dirs() {
         _save_dirlist_cache
     fi
 
+    # Apply ignore list (paths hidden via delete-prompt without "confirm")
+    if [[ -f "$IGNORE_FILE" ]]; then
+        local -A _ignore=()
+        while IFS= read -r _il; do
+            [[ -z "$_il" || "$_il" == \#* ]] && continue
+            _ignore["$_il"]=1
+        done < "$IGNORE_FILE"
+        if (( ${#_ignore[@]} > 0 )); then
+            local -a _fd=() _fs=()
+            for (( _ig = 0; _ig < ${#tmp_dirs[@]}; _ig++ )); do
+                if [[ -z "${_ignore[${tmp_dirs[$_ig]}]:-}" ]]; then
+                    _fd+=("${tmp_dirs[$_ig]}")
+                    _fs+=("${tmp_sources[$_ig]}")
+                fi
+            done
+            tmp_dirs=("${_fd[@]}")
+            tmp_sources=("${_fs[@]}")
+        fi
+    fi
+
     # Filter to current view_mode (dirlist cache stores superset)
     if [[ "$view_mode" == "local" ]]; then
         local -a filtered_dirs=() filtered_sources=()
@@ -1121,7 +1142,7 @@ load_dirs() {
                 (( miss_count++ ))
             else
                 local c_mtime
-                IFS=$'\t' read -r c_mtime _ <<< "$cached"
+                IFS=$'\x1f' read -r c_mtime _ <<< "$cached"
                 if [[ "$c_mtime" != "$mt" ]]; then
                     (( miss_count++ ))
                 fi
@@ -1197,7 +1218,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.3.0 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.3.1 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -1845,40 +1866,56 @@ do_delete() {
     idx=$(_get_real_idx) || return
     local title="${cache_title[$idx]}"
     local source="${cache_source[$idx]}"
+    local dir="${dirs[$idx]}"
 
-    local prompt_msg="Delete '$title' and all contents?"
-    if [[ "$source" == "external" ]]; then
-        prompt_msg="Remove '$title' from list? (files kept)"
-    fi
+    # Two-tier safety: default = hide from claudemanager only; type "confirm" to wipe files from disk.
+    local response
+    response=$(prompt_input "Hide '$title' (enter), or type 'confirm' to DELETE files from disk: ")
 
-    if confirm "$prompt_msg"; then
+    if [[ "$response" == "confirm" ]]; then
         if [[ "$source" == "external" ]]; then
-            # Just remove from extra dirs file
-            local dir="${dirs[$idx]}"
+            # External dirs aren't under our control — refuse to nuke them from this prompt
+            status_msg="External dir; remove via 'a' management or rm by hand"
+            status_color="${byellow}${bold}"
+            return
+        fi
+        rm -rf "$dir"
+        # Also drop from ignore file if present
+        if [[ -f "$IGNORE_FILE" ]]; then
+            local tmp
+            tmp=$(grep -v "^${dir}$" "$IGNORE_FILE" 2>/dev/null || true)
+            printf '%s\n' "$tmp" > "$IGNORE_FILE"
+        fi
+        status_msg="DELETED from disk: $title"
+        status_color="${bred}${bold}"
+    elif [[ -z "$response" || "$response" == "y" || "$response" == "Y" || "$response" == "yes" ]]; then
+        # Hide from claudemanager view
+        if [[ "$source" == "external" ]]; then
+            # Same as before: remove from extra-dirs list
             if [[ -f "$EXTRA_DIRS_FILE" ]]; then
                 local tmp
                 tmp=$(grep -v "^${dir}$" "$EXTRA_DIRS_FILE" 2>/dev/null || true)
                 printf '%s\n' "$tmp" > "$EXTRA_DIRS_FILE"
             fi
-        else
-            rm -rf "${dirs[$idx]}"
-        fi
-        load_dirs
-        _apply_groups_to_cache
-    _apply_demo_mode
-        if (( selected >= ${#filtered[@]} )); then
-            selected=$(( ${#filtered[@]} - 1 ))
-            (( selected < 0 )) && selected=0
-        fi
-        if [[ "$source" == "external" ]]; then
             status_msg="Removed from list: $title"
         else
-            status_msg="Deleted: $title"
+            # Add to ignore file — load_dirs filters these out
+            printf '%s\n' "$dir" >> "$IGNORE_FILE"
+            status_msg="Hidden: $title  (files kept on disk)"
         fi
-        status_color="${bred}${bold}"
+        status_color="${byellow}${bold}"
     else
         status_msg="Cancelled"
         status_color="$dim"
+        return
+    fi
+
+    load_dirs
+    _apply_groups_to_cache
+    _apply_demo_mode
+    if (( selected >= ${#filtered[@]} )); then
+        selected=$(( ${#filtered[@]} - 1 ))
+        (( selected < 0 )) && selected=0
     fi
 }
 
@@ -2986,7 +3023,7 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  2.3.0' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  2.3.1' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     # Show last modified date + relative time of the installed script
