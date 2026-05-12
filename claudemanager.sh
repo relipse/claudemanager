@@ -64,6 +64,18 @@ tui() {
 }
 
 hide_cursor()  { tui '\e[?25l'; }
+
+# Mouse SGR tracking: button-events + extended coords (works in iTerm/Terminal.app/xterm)
+enable_mouse()  { tui '\e[?1000h\e[?1006h'; }
+disable_mouse() { tui '\e[?1006l\e[?1000l'; }
+
+# Layout snapshot from last draw() — used to map mouse clicks back to items
+_mouse_list_start=0
+_mouse_row_height=1
+_mouse_grid_cols=1
+_mouse_cell_width=24
+_mouse_cell_height=2
+_mouse_display_mode=""
 show_cursor()  { tui '\e[?25h'; }
 move_to()      { tui '\e[%d;%dH' "$1" "$2"; }
 clear_screen() { tui '\e[2J\e[H'; }
@@ -1204,6 +1216,7 @@ draw() {
     term_lines=$(tput_lines)
     term_cols=$(tput_cols)
 
+    _mouse_display_mode="$display_mode"
     # Details panel reserves N lines at the bottom for the selected item
     local details_height=8
     if (( ${#filtered[@]} == 0 )); then details_height=0; fi
@@ -1218,7 +1231,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.3.2 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.4.0 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -1272,6 +1285,7 @@ draw() {
 
     # ── List area ──
     local list_start=$(( header_end + 1 ))
+    _mouse_list_start="$list_start"
 
     if [[ "$display_mode" == "grid" ]]; then
         # ── GRID MODE ──
@@ -1279,6 +1293,9 @@ draw() {
         local cell_height=2
         local grid_cols=$(( (term_cols - 2) / cell_width ))
         (( grid_cols < 1 )) && grid_cols=1
+        _mouse_cell_width="$cell_width"
+        _mouse_cell_height="$cell_height"
+        _mouse_grid_cols="$grid_cols"
         local grid_rows=$(( (effective_lines - list_start - 2) / cell_height ))
         (( grid_rows < 1 )) && grid_rows=1
         local max_items=$(( grid_cols * grid_rows ))
@@ -1357,6 +1374,7 @@ draw() {
         # ── LIST MODES (compact / full) ──
         local row_height=3
         [[ "$display_mode" == "compact" ]] && row_height=1
+        _mouse_row_height="$row_height"
         local max_items=$(( (effective_lines - list_start - 2) / row_height ))
         (( max_items < 1 )) && max_items=1
 
@@ -1616,12 +1634,23 @@ draw() {
 
 # ── Input (reads from /dev/tty) ──────────────────────────────────
 read_key() {
-    local key
+    local key c
     IFS= read -rsn1 key < /dev/tty || return 1
     if [[ "$key" == $'\e' ]]; then
-        local seq
-        IFS= read -rsn2 -t 0.1 seq < /dev/tty || true
-        key="${key}${seq}"
+        # Bracketed sequence — read intro byte
+        IFS= read -rsn1 -t 0.1 c < /dev/tty || c=""
+        key+="$c"
+        if [[ "$c" == "[" ]]; then
+            IFS= read -rsn1 -t 0.1 c < /dev/tty || c=""
+            key+="$c"
+            if [[ "$c" == "<" ]]; then
+                # Mouse SGR — read until M or m
+                while IFS= read -rsn1 -t 0.5 c < /dev/tty; do
+                    key+="$c"
+                    [[ "$c" == "M" || "$c" == "m" ]] && break
+                done
+            fi
+        fi
     fi
     printf '%s' "$key"
 }
@@ -3023,7 +3052,7 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  2.3.2' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  2.4.0' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     # Show last modified date + relative time of the installed script
@@ -3672,6 +3701,7 @@ _try_quick_open() {
 # ── Main ──────────────────────────────────────────────────────────
 cleanup() {
     [[ -n "${_spinner_pid:-}" ]] && kill "$_spinner_pid" 2>/dev/null && wait "$_spinner_pid" 2>/dev/null || true
+    disable_mouse 2>/dev/null || true
     show_cursor
     clear_screen
     stty sane 2>/dev/null || true
@@ -3957,11 +3987,67 @@ main() {
     fi
 
     hide_cursor
+    enable_mouse
 
     while true; do
         draw
         local key
         key=$(read_key) || { action="quit"; break; }
+
+        # Mouse SGR event: \e[<btn;col;rowM (press) or m (release)
+        if [[ "$key" == $'\e'\[\<* ]]; then
+            local _body="${key#$'\e'\[\<}"
+            local _act="${_body: -1}"   # M or m
+            local _coords="${_body%[Mm]}"
+            local _btn _col _row
+            IFS=";" read -r _btn _col _row <<< "$_coords"
+            case "$_btn" in
+                64) # wheel up
+                    if [[ "$_mouse_display_mode" == "grid" ]]; then
+                        (( selected >= _mouse_grid_cols )) && (( selected -= _mouse_grid_cols ))
+                    else
+                        (( selected > 0 )) && (( selected-- )) || true
+                    fi
+                    continue
+                    ;;
+                65) # wheel down
+                    if [[ "$_mouse_display_mode" == "grid" ]]; then
+                        (( selected + _mouse_grid_cols < ${#filtered[@]} )) && (( selected += _mouse_grid_cols )) || true
+                    else
+                        (( selected < ${#filtered[@]} - 1 )) && (( selected++ )) || true
+                    fi
+                    continue
+                    ;;
+                0) # left button
+                    if [[ "$_act" == "M" ]]; then
+                        # Map click to item index
+                        local _cidx=-1
+                        if [[ "$_mouse_display_mode" == "grid" ]]; then
+                            local _gr=$(( (_row - _mouse_list_start) / _mouse_cell_height ))
+                            local _gc=$(( (_col - 2) / _mouse_cell_width ))
+                            (( _gr >= 0 && _gc >= 0 && _gc < _mouse_grid_cols )) && _cidx=$(( scroll_offset + _gr * _mouse_grid_cols + _gc ))
+                        else
+                            local _lr=$(( (_row - _mouse_list_start) / _mouse_row_height ))
+                            (( _lr >= 0 )) && _cidx=$(( scroll_offset + _lr ))
+                        fi
+                        if (( _cidx >= 0 && _cidx < ${#filtered[@]} )); then
+                            if (( _cidx == selected )); then
+                                # Click on already-selected item → treat as Enter
+                                key=""
+                            else
+                                selected="$_cidx"
+                                continue
+                            fi
+                        else
+                            continue
+                        fi
+                    else
+                        continue
+                    fi
+                    ;;
+                *) continue ;;
+            esac
+        fi
 
         # Compute grid_cols for navigation (must match draw)
         local nav_grid_cols=1
