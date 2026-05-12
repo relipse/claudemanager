@@ -16,7 +16,7 @@ CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
 EXTRA_DIRS_FILE="$CLAUDE_BASE/.claudemanager_dirs"
 IGNORE_FILE="$CLAUDE_BASE/.claudemanager_ignore"
 CACHE_FILE="$CLAUDE_BASE/.claudemanager_cache"
-CACHE_SCHEMA="5"  # bump when _compute_title/_compute_* output format changes
+CACHE_SCHEMA="6"  # bump when _compute_title/_compute_* output format changes
 BUILD_DATE=$(stat -f '%Sm' -t '%Y-%m-%d' "${BASH_SOURCE[0]}" 2>/dev/null || date '+%Y-%m-%d')
 DIRLIST_CACHE="$CLAUDE_BASE/.claudemanager_dirlist"
 PREFS_FILE="$CLAUDE_BASE/.claudemanager_prefs"
@@ -379,18 +379,7 @@ _compute_title() {
         cat "$dir/.name"
         return
     fi
-    # 1b. Timestamped scratch dir (YYYYMMDD_HHMMSS / YYYYMMDD-HHMMSS): render as "Mon DD HH:MM"
     local _ct_base="${dir##*/}"
-    if [[ "$_ct_base" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})[_-]([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
-        local _ct_pretty
-        _ct_pretty=$(date -j -f '%Y%m%d%H%M%S' \
-            "${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}" \
-            '+%b %d %H:%M' 2>/dev/null)
-        if [[ -n "$_ct_pretty" ]]; then
-            printf '%s' "$_ct_pretty"
-            return
-        fi
-    fi
     # 2. Look for a single prominent subdirectory (skip .hidden, xcodeproj, etc)
     local app_dirs=()
     for f in "$dir"/*/; do
@@ -429,6 +418,17 @@ _compute_title() {
             else
                 printf '%s' "$prefix"
             fi
+            return
+        fi
+    fi
+    # 2c. Timestamped scratch dir with no clear subdir name → pretty date "Mon DD HH:MM"
+    if [[ "$_ct_base" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})[_-]([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+        local _ct_pretty
+        _ct_pretty=$(date -j -f '%Y%m%d%H%M%S' \
+            "${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}" \
+            '+%b %d %H:%M' 2>/dev/null)
+        if [[ -n "$_ct_pretty" ]]; then
+            printf '%s' "$_ct_pretty"
             return
         fi
     fi
@@ -1218,7 +1218,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.3.1 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.3.2 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -3023,7 +3023,7 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  2.3.1' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  2.3.2' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     # Show last modified date + relative time of the installed script
