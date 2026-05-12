@@ -15,6 +15,8 @@ CLAUDE_BASE="${CLAUDE_BASE:-$HOME/.claudemanager}"
 CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
 EXTRA_DIRS_FILE="$CLAUDE_BASE/.claudemanager_dirs"
 CACHE_FILE="$CLAUDE_BASE/.claudemanager_cache"
+CACHE_SCHEMA="4"  # bump when _compute_title/_compute_* output format changes
+BUILD_DATE=$(stat -f '%Sm' -t '%Y-%m-%d' "${BASH_SOURCE[0]}" 2>/dev/null || date '+%Y-%m-%d')
 DIRLIST_CACHE="$CLAUDE_BASE/.claudemanager_dirlist"
 PREFS_FILE="$CLAUDE_BASE/.claudemanager_prefs"
 HISTORY_FILE="$CLAUDE_BASE/.claudemanager_history"
@@ -76,7 +78,7 @@ open_force_run=false
 status_msg=""
 status_color="$green"
 search_query=""
-sort_mode="date"       # date | name | language
+sort_mode="date"       # date | modified | recent | name | language
 view_mode="local"      # local | all
 display_mode="compact"  # compact | full | grid
 title_mode="scroll_region" # none | window_title | tmux_split | tmux_status | scroll_region | prompt
@@ -340,6 +342,7 @@ declare -a cache_framework=()
 declare -a cache_source=()     # "local" | "external" | "discovered"
 declare -a cache_fullpath=()   # full path for display on external dirs
 declare -a cache_mtime=()      # directory mtime (for save without re-stat)
+declare -a cache_recent=()     # max mtime of any file in the tree (for "modified" sort)
 declare -a cache_group=()      # group/client name per project
 declare -A group_map=()        # group_map["path"] = "group_name"
 
@@ -375,6 +378,18 @@ _compute_title() {
         cat "$dir/.name"
         return
     fi
+    # 1b. Timestamped scratch dir (YYYYMMDD_HHMMSS / YYYYMMDD-HHMMSS): render as "Mon DD HH:MM"
+    local _ct_base="${dir##*/}"
+    if [[ "$_ct_base" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})[_-]([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+        local _ct_pretty
+        _ct_pretty=$(date -j -f '%Y%m%d%H%M%S' \
+            "${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}" \
+            '+%b %d %H:%M' 2>/dev/null)
+        if [[ -n "$_ct_pretty" ]]; then
+            printf '%s' "$_ct_pretty"
+            return
+        fi
+    fi
     # 2. Look for a single prominent subdirectory (skip .hidden, xcodeproj, etc)
     local app_dirs=()
     for f in "$dir"/*/; do
@@ -387,7 +402,13 @@ _compute_title() {
         app_dirs+=("$name")
     done
     if (( ${#app_dirs[@]} == 1 )); then
-        printf '%s' "${app_dirs[0]}"
+        local _ct_name="${app_dirs[0]}"
+        # If the subdir name is short, qualify it with the parent project dir for clarity (e.g. "pub" → "truthinjesus/pub")
+        if (( ${#_ct_name} <= 4 )) && [[ -n "$_ct_base" ]]; then
+            printf '%s/%s' "$_ct_base" "$_ct_name"
+        else
+            printf '%s' "$_ct_name"
+        fi
         return
     fi
     # 2b. Multiple dirs: find longest common prefix (e.g. BobcatHunter, BobcatHunter-Godot → BobcatHunter)
@@ -402,12 +423,25 @@ _compute_title() {
         prefix="${prefix%-}"
         prefix="${prefix%_}"
         if (( ${#prefix} >= 3 )); then
-            printf '%s' "$prefix"
+            if (( ${#prefix} <= 4 )) && [[ -n "$_ct_base" ]]; then
+                printf '%s/%s' "$_ct_base" "$prefix"
+            else
+                printf '%s' "$prefix"
+            fi
             return
         fi
     fi
-    # 3. Fall back to directory basename
-    basename "$dir"
+    # 3. Fall back to directory basename — qualify with parent dir if too short
+    local _ct_self="${dir##*/}"
+    if (( ${#_ct_self} <= 4 )); then
+        local _ct_parent="${dir%/*}"
+        _ct_parent="${_ct_parent##*/}"
+        if [[ -n "$_ct_parent" && "$_ct_parent" != "$_ct_self" ]]; then
+            printf '%s/%s' "$_ct_parent" "$_ct_self"
+            return
+        fi
+    fi
+    printf '%s' "$_ct_self"
 }
 
 _compute_date() {
@@ -503,6 +537,33 @@ _compute_filecount() {
         2>/dev/null | wc -l | tr -d ' '
 }
 
+
+# Max mtime of any file in the tree (for "modified" sort)
+_compute_recent() {
+    local maxv
+    maxv=$(find "$1" -maxdepth 4 -type f \
+        -not -path '*/.git/*' -not -path '*/.build/*' \
+        -not -path '*/build/*' -not -path '*/.godot/*' \
+        -not -path '*/node_modules/*' \
+        -not -name '.DS_Store' -not -name '*.o' \
+        -print0 2>/dev/null \
+        | xargs -0 stat -f '%m' 2>/dev/null \
+        | sort -nr | head -1)
+    printf '%s' "${maxv:-0}"
+}
+
+# Top-N most-recently-modified files (relative path, mtime) — for details panel
+_compute_recent_files() {
+    local d="$1" n="${2:-5}"
+    find "$d" -maxdepth 4 -type f \
+        -not -path '*/.git/*' -not -path '*/.build/*' \
+        -not -path '*/build/*' -not -path '*/.godot/*' \
+        -not -path '*/node_modules/*' \
+        -not -name '.DS_Store' -not -name '*.o' \
+        -print0 2>/dev/null \
+        | xargs -0 stat -f '%m %N' 2>/dev/null \
+        | sort -nr | head -n "$n"
+}
 _compute_language() {
     local dir="$1"
     local swift_count=0 py_count=0 js_count=0 ts_count=0 html_count=0
@@ -602,12 +663,16 @@ sort_dirs() {
                 [[ -z "$lk" ]] && lk="zzz"
                 sort_keys+=("${lk,,}|$i")
                 ;;
+            modified)
+                local rec="${cache_recent[$i]:-0}"
+                sort_keys+=("$(printf '%020d' "$rec")|$i")
+                ;;
         esac
     done
 
     # Sort and rebuild arrays
     local -a sorted_indices=()
-    if [[ "$sort_mode" == "date" || "$sort_mode" == "recent" ]]; then
+    if [[ "$sort_mode" == "date" || "$sort_mode" == "recent" || "$sort_mode" == "modified" ]]; then
         while IFS= read -r line; do
             sorted_indices+=("${line##*|}")
         done < <(printf '%s\n' "${sort_keys[@]}" | sort -r)
@@ -620,7 +685,7 @@ sort_dirs() {
     # Rebuild all parallel arrays in sorted order
     local -a new_dirs=() new_title=() new_base=() new_date=() new_reldate=()
     local -a new_desc=() new_files=() new_lang=() new_langcolor=() new_framework=()
-    local -a new_source=() new_fullpath=() new_epoch=() new_mtime=()
+    local -a new_source=() new_fullpath=() new_epoch=() new_mtime=() new_recent=()
     for i in "${sorted_indices[@]}"; do
         new_dirs+=("${dirs[$i]}")
         new_title+=("${cache_title[$i]}")
@@ -636,6 +701,7 @@ sort_dirs() {
         new_fullpath+=("${cache_fullpath[$i]}")
         new_epoch+=("${cache_epoch[$i]}")
         new_mtime+=("${cache_mtime[$i]:-}")
+        new_recent+=("${cache_recent[$i]:-0}")
     done
     dirs=("${new_dirs[@]}")
     cache_title=("${new_title[@]}")
@@ -651,10 +717,20 @@ sort_dirs() {
     cache_fullpath=("${new_fullpath[@]}")
     cache_epoch=("${new_epoch[@]}")
     cache_mtime=("${new_mtime[@]}")
+    cache_recent=("${new_recent[@]}")
 }
 
 # ── Disk cache for fast startup ──────────────────────────────────
 declare -A disk_cache=()
+declare -A _recent_files_memo=()
+
+_get_recent_files_cached() {
+    local d="$1"
+    if [[ -z "${_recent_files_memo[$d]+x}" ]]; then
+        _recent_files_memo["$d"]="$(_compute_recent_files "$d" 3)"
+    fi
+    printf '%s' "${_recent_files_memo[$d]}"
+}
 declare -a cache_epoch=()
 
 # Sets $_lcolor variable (no subshell)
@@ -683,14 +759,19 @@ _epoch_to_reldate() {
         _reldate=""
         return
     fi
-    local diff_days=$(( (now_epoch - then_epoch) / 86400 ))
-    if (( diff_days < 0 )); then _reldate=""
-    elif (( diff_days == 0 )); then _reldate="today"
-    elif (( diff_days == 1 )); then _reldate="yesterday"
-    elif (( diff_days < 7 )); then _reldate="${diff_days}d ago"
-    elif (( diff_days < 30 )); then _reldate="$(( diff_days / 7 ))w ago"
-    elif (( diff_days < 365 )); then _reldate="$(( diff_days / 30 ))mo ago"
-    else _reldate="$(( diff_days / 365 ))y ago"
+    local diff=$(( now_epoch - then_epoch ))
+    if (( diff < 0 )); then _reldate=""
+    elif (( diff < 60 )); then _reldate="just now"
+    elif (( diff < 3600 )); then _reldate="$(( diff / 60 ))min ago"
+    elif (( diff < 86400 )); then _reldate="$(( diff / 3600 ))hr ago"
+    else
+        local diff_days=$(( diff / 86400 ))
+        if   (( diff_days == 1 )); then _reldate="yesterday"
+        elif (( diff_days < 7 ));  then _reldate="${diff_days}d ago"
+        elif (( diff_days < 30 )); then _reldate="$(( diff_days / 7 ))w ago"
+        elif (( diff_days < 365 )); then _reldate="$(( diff_days / 30 ))mo ago"
+        else _reldate="$(( diff_days / 365 ))y ago"
+        fi
     fi
 }
 
@@ -745,9 +826,15 @@ _load_dirlist_cache() {
 _load_disk_cache() {
     disk_cache=()
     [[ -f "$CACHE_FILE" ]] || return 0
-    while IFS=$'\t' read -r c_path c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch; do
+    # Skip cache if schema version differs (forces a clean recompute when logic changes)
+    local _cache_schema
+    _cache_schema=$(awk -F': ' '/^# schema:/{print $2; exit}' "$CACHE_FILE")
+    if [[ "$_cache_schema" != "$CACHE_SCHEMA" ]]; then
+        return 0
+    fi
+    while IFS=$'\t' read -r c_path c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch c_recent; do
         [[ -z "$c_path" || "$c_path" == \#* ]] && continue
-        disk_cache["$c_path"]="${c_mtime}	${c_title}	${c_date}	${c_desc}	${c_files}	${c_lang}	${c_framework}	${c_epoch}"
+        disk_cache["$c_path"]="${c_mtime}	${c_title}	${c_date}	${c_desc}	${c_files}	${c_lang}	${c_framework}	${c_epoch}	${c_recent:-0}"
     done < "$CACHE_FILE"
 }
 
@@ -755,6 +842,7 @@ _save_disk_cache() {
     local i
     {
         printf '# claudemanager cache - auto-generated\n'
+        printf '# schema: %s\n' "$CACHE_SCHEMA"
         for (( i = 0; i < ${#dirs[@]}; i++ )); do
             local d="${dirs[$i]}"
             local mtime="${cache_mtime[$i]:-}"
@@ -766,7 +854,8 @@ _save_disk_cache() {
             local l="${cache_lang[$i]}"
             local fw="${cache_framework[$i]//$'\t'/ }"
             local ep="${cache_epoch[$i]}"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$mtime" "$t" "$dt" "$ds" "$f" "$l" "$fw" "$ep"
+            local rec="${cache_recent[$i]:-0}"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$mtime" "$t" "$dt" "$ds" "$f" "$l" "$fw" "$ep" "$rec"
         done
     } > "$CACHE_FILE"
 }
@@ -780,13 +869,15 @@ _cache_one_dir() {
     cache_fullpath+=("$d")
     cache_mtime+=("$dir_mtime")
 
-    # Try disk cache (mtime-based invalidation)
-    if [[ "$use_cache" == "true" && -n "$dir_mtime" ]]; then
+    # Try disk cache (mtime-based invalidation; timestamp-named dirs are immutable identity → skip mtime check)
+    local _ts_dir=false
+    [[ "${d##*/}" =~ ^[0-9]{8}[_-][0-9]{6}$ ]] && _ts_dir=true
+    if [[ "$use_cache" == "true" && ( -n "$dir_mtime" || "$_ts_dir" == "true" ) ]]; then
         local cached="${disk_cache[$d]:-}"
         if [[ -n "$cached" ]]; then
-            local c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch
-            IFS=$'\t' read -r c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch <<< "$cached"
-            if [[ "$c_mtime" == "$dir_mtime" ]]; then
+            local c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch c_recent
+            IFS=$'\t' read -r c_mtime c_title c_date c_desc c_files c_lang c_framework c_epoch c_recent <<< "$cached"
+            if [[ "$_ts_dir" == "true" || "$c_mtime" == "$dir_mtime" ]]; then
                 cache_title+=("$c_title")
                 cache_date+=("$c_date")
                 _epoch_to_reldate "$c_epoch" "$now_epoch"
@@ -798,6 +889,7 @@ _cache_one_dir() {
                 cache_langcolor+=("$_lcolor")
                 cache_framework+=("$c_framework")
                 cache_epoch+=("$c_epoch")
+                cache_recent+=("${c_recent:-0}")
                 return
             fi
         fi
@@ -819,6 +911,7 @@ _cache_one_dir() {
     cache_lang+=("$_lang_name")
     cache_langcolor+=("$_lang_color")
     cache_framework+=("$_framework")
+    cache_recent+=("$(_compute_recent "$d")")
 }
 
 # ── Load & cache everything ───────────────────────────────────────
@@ -838,6 +931,7 @@ load_dirs() {
     cache_fullpath=()
     cache_mtime=()
     cache_epoch=()
+    cache_recent=()
 
     # Load disk cache for fast startup
     if [[ "$force" == "false" ]]; then
@@ -899,10 +993,21 @@ load_dirs() {
             while IFS= read -r proj_dir; do
                 [[ -d "$proj_dir" ]] || continue
                 # Decode path: -Users-foo-bar => /Users/foo/bar
-                local decoded_path
-                decoded_path=$(basename "$proj_dir" | sed 's/^-/\//; s/-/\//g')
+                # Claude Code encodes both "/" and "_" as "-" → walk the FS to disambiguate.
+                local decoded_path=""
+                # Preferred: read cwd from any session JSONL (authoritative — handles "_" in name)
+                local _jf
+                for _jf in "$proj_dir"/*.jsonl; do
+                    [[ -f "$_jf" ]] || continue
+                    decoded_path=$(grep -m1 -o '"cwd":"[^"]*"' "$_jf" 2>/dev/null | head -1 | sed 's/^"cwd":"//;s/"$//')
+                    [[ -n "$decoded_path" ]] && break
+                done
+                # Fallback: lossy hyphen-to-slash decoding
+                if [[ -z "$decoded_path" ]]; then
+                    decoded_path=$(basename "$proj_dir" | sed 's/^-/\//; s/-/\//g')
+                fi
                 # Verify directory exists and isn't inside CLAUDE_BASE
-                if [[ -d "$decoded_path" ]]; then
+                if [[ -n "$decoded_path" && -d "$decoded_path" ]]; then
                     local rp
                     rp=$(realpath "$decoded_path" 2>/dev/null) || rp="$decoded_path"
                     # Skip if already in local list
@@ -930,6 +1035,26 @@ load_dirs() {
             done
             while IFS= read -r line; do
                 [[ -z "$line" || "$line" == \#* ]] && continue
+                # Parent-scan: line ending in /* expands to direct subdirs
+                if [[ "$line" == */\* ]]; then
+                    local parent="${line%/\*}"
+                    [[ -d "$parent" ]] || continue
+                    local child
+                    while IFS= read -r child; do
+                        [[ -d "$child" ]] || continue
+                        local cbase
+                        cbase="${child##*/}"
+                        [[ "$cbase" == .* ]] && continue
+                        local crp
+                        crp=$(realpath "$child" 2>/dev/null) || crp="$child"
+                        if [[ -z "${seen_extra[$crp]:-}" ]]; then
+                            seen_extra["$crp"]=1
+                            tmp_dirs+=("$child")
+                            tmp_sources+=("external")
+                        fi
+                    done < <(find "$parent" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r)
+                    continue
+                fi
                 if [[ -d "$line" ]]; then
                     local rp
                     rp=$(realpath "$line" 2>/dev/null) || rp="$line"
@@ -986,7 +1111,13 @@ load_dirs() {
             local d="${tmp_dirs[$idx]}"
             local mt="${all_mtimes[$idx]:-}"
             local cached="${disk_cache[$d]:-}"
-            if [[ -z "$cached" || -z "$mt" ]]; then
+            local _ts_check=false
+            [[ "${d##*/}" =~ ^[0-9]{8}[_-][0-9]{6}$ ]] && _ts_check=true
+            if [[ -z "$cached" ]]; then
+                (( miss_count++ ))
+            elif [[ "$_ts_check" == "true" ]]; then
+                : # timestamp dirs: any cached entry counts as a hit
+            elif [[ -z "$mt" ]]; then
                 (( miss_count++ ))
             else
                 local c_mtime
@@ -1042,6 +1173,8 @@ refresh_cache() {
     cache_title[$idx]="$(_compute_title "$d")"
     cache_base[$idx]="$(basename "$d")"
     cache_desc[$idx]="$(_compute_desc "$d")"
+    cache_recent[$idx]="$(_compute_recent "$d")"
+    unset '_recent_files_memo[$d]'
 }
 
 # ── Drawing ───────────────────────────────────────────────────────
@@ -1049,6 +1182,12 @@ draw() {
     local term_lines term_cols
     term_lines=$(tput_lines)
     term_cols=$(tput_cols)
+
+    # Details panel reserves N lines at the bottom for the selected item
+    local details_height=8
+    if (( ${#filtered[@]} == 0 )); then details_height=0; fi
+    if (( term_lines < 24 )); then details_height=0; fi
+    local effective_lines=$(( term_lines - details_height ))
 
     clear_screen
 
@@ -1058,6 +1197,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
+    tui '  %sv2.3.0 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -1118,7 +1258,7 @@ draw() {
         local cell_height=2
         local grid_cols=$(( (term_cols - 2) / cell_width ))
         (( grid_cols < 1 )) && grid_cols=1
-        local grid_rows=$(( (term_lines - list_start - 2) / cell_height ))
+        local grid_rows=$(( (effective_lines - list_start - 2) / cell_height ))
         (( grid_rows < 1 )) && grid_rows=1
         local max_items=$(( grid_cols * grid_rows ))
 
@@ -1158,7 +1298,7 @@ draw() {
             local max_title=$(( cell_width - 4 ))
             local disp_title="$title"
             if (( ${#disp_title} > max_title )); then
-                disp_title="${disp_title:0:$((max_title - 1))}\u2026"
+                disp_title="${disp_title:0:$((max_title - 1))}…"
             fi
 
             move_to "$row" "$col"
@@ -1173,7 +1313,7 @@ draw() {
             if [[ -n "$lang_name" ]]; then
                 local disp_lang="$lang_name"
                 if (( ${#disp_lang} > max_title )); then
-                    disp_lang="${disp_lang:0:$((max_title - 1))}\u2026"
+                    disp_lang="${disp_lang:0:$((max_title - 1))}…"
                 fi
                 tui ' %s%s%s' "${lang_color}${dim}" "$disp_lang" "${reset}"
             else
@@ -1188,7 +1328,7 @@ draw() {
         fi
         if (( scroll_offset + max_items < ${#filtered[@]} )); then
             local bottom_row=$(( list_start + grid_rows * cell_height ))
-            (( bottom_row > term_lines - 1 )) && bottom_row=$(( term_lines - 1 ))
+            (( bottom_row > effective_lines - 1 )) && bottom_row=$(( effective_lines - 1 ))
             move_to "$bottom_row" 3
             tui '%sv more below%s' "${byellow}${bold}" "${reset}"
         fi
@@ -1196,7 +1336,7 @@ draw() {
         # ── LIST MODES (compact / full) ──
         local row_height=3
         [[ "$display_mode" == "compact" ]] && row_height=1
-        local max_items=$(( (term_lines - list_start - 2) / row_height ))
+        local max_items=$(( (effective_lines - list_start - 2) / row_height ))
         (( max_items < 1 )) && max_items=1
 
         if (( selected < scroll_offset )); then
@@ -1346,9 +1486,102 @@ draw() {
         fi
         if (( scroll_offset + max_items < ${#filtered[@]} )); then
             local bottom_row=$(( list_start + max_items * row_height ))
-            (( bottom_row > term_lines - 1 )) && bottom_row=$(( term_lines - 1 ))
+            (( bottom_row > effective_lines - 1 )) && bottom_row=$(( effective_lines - 1 ))
             move_to "$bottom_row" 3
             tui '%sv more below%s' "${byellow}${bold}" "${reset}"
+        fi
+    fi
+
+    # ── Details panel for selected item ──
+    if (( details_height > 0 && ${#filtered[@]} > 0 && selected < ${#filtered[@]} )); then
+        local _dp_idx="${filtered[$selected]}"
+        local _dp_row=$(( effective_lines + 1 ))
+        local _dp_inner_w=$(( term_cols - 4 ))
+        (( _dp_inner_w > 120 )) && _dp_inner_w=120
+
+        # Top separator
+        move_to "$_dp_row" 1
+        tui '  %s%s%s' "${dim}${cyan}" "$(printf '%*s' "$_dp_inner_w" '' | tr ' ' '─')" "${reset}"
+
+        local _dp_title="${cache_title[$_dp_idx]}"
+        local _dp_base="${cache_base[$_dp_idx]}"
+        local _dp_path="${cache_fullpath[$_dp_idx]}"
+        local _dp_rel="${cache_reldate[$_dp_idx]}"
+        local _dp_lang="${cache_lang[$_dp_idx]}"
+        local _dp_lcolor="${cache_langcolor[$_dp_idx]}"
+        local _dp_fw="${cache_framework[$_dp_idx]}"
+        local _dp_src="${cache_source[$_dp_idx]}"
+        local _dp_files="${cache_files[$_dp_idx]}"
+        local _dp_desc="${cache_desc[$_dp_idx]}"
+        local _dp_grp="${cache_group[$_dp_idx]:-}"
+
+        # Line 1: title + reldate + source
+        move_to $(( _dp_row + 1 )) 3
+        tui '%s%s%s' "${bold}${bwhite}" "$_dp_title" "${reset}"
+        [[ -n "$_dp_rel" ]] && tui '  %s%s%s' "${dim}" "$_dp_rel" "${reset}"
+        [[ -n "$_dp_grp" ]] && tui '  %s{%s}%s' "${dim}${bmagenta}" "$_dp_grp" "${reset}"
+        if [[ "$_dp_src" == "discovered" ]]; then
+            tui '  %s[claude]%s' "${dim}${bcyan}" "${reset}"
+        elif [[ "$_dp_src" == "external" ]]; then
+            tui '  %s[added]%s' "${dim}${bcyan}" "${reset}"
+        fi
+
+        # Line 2: path
+        move_to $(( _dp_row + 2 )) 3
+        local _dp_path_show="$_dp_path"
+        local _dp_home="$HOME"
+        _dp_path_show="${_dp_path_show/#$_dp_home/~}"
+        if (( ${#_dp_path_show} > _dp_inner_w - 2 )); then
+            _dp_path_show="…${_dp_path_show: -$(( _dp_inner_w - 3 ))}"
+        fi
+        tui '%s%s%s' "${dim}" "$_dp_path_show" "${reset}"
+
+        # Line 3: meta (files, lang, framework, base if differs)
+        move_to $(( _dp_row + 3 )) 3
+        tui '%s%s files%s' "${dim}" "$_dp_files" "${reset}"
+        if [[ -n "$_dp_lang" ]]; then
+            tui '  %s%s%s' "${_dp_lcolor}" "$_dp_lang" "${reset}"
+        fi
+        if [[ -n "$_dp_fw" ]]; then
+            tui '  %s%s%s%s' "${dim}" "${italic}" "$_dp_fw" "${reset}"
+        fi
+        if [[ "$_dp_base" != "$_dp_title" ]]; then
+            tui '  %s(%s)%s' "${dim}" "$_dp_base" "${reset}"
+        fi
+
+        # Line 4: description (truncated)
+        if [[ -n "$_dp_desc" ]]; then
+            move_to $(( _dp_row + 4 )) 3
+            local _dp_dmax=$(( _dp_inner_w - 2 ))
+            local _dp_dshow="$_dp_desc"
+            (( ${#_dp_dshow} > _dp_dmax )) && _dp_dshow="${_dp_dshow:0:$((_dp_dmax-1))}…"
+            tui '%s%s%s' "${dim}${italic}" "$_dp_dshow" "${reset}"
+        fi
+
+        # Lines 5-7: recent files
+        local _dp_rf
+        _dp_rf=$(_get_recent_files_cached "$_dp_path")
+        if [[ -n "$_dp_rf" ]]; then
+            move_to $(( _dp_row + 5 )) 3
+            tui '%srecent:%s' "${dim}${bold}" "${reset}"
+            local _dp_rfi=0
+            local _dp_now
+            _dp_now=$(date '+%s')
+            while IFS= read -r _dp_line; do
+                [[ -z "$_dp_line" ]] && continue
+                local _dp_mt="${_dp_line%% *}"
+                local _dp_fp="${_dp_line#* }"
+                local _dp_rfp="${_dp_fp#$_dp_path/}"
+                local _dp_age=""
+                _epoch_to_reldate "${_dp_mt%%.*}" "$_dp_now"
+                _dp_age="$_reldate"
+                local _dp_max_rf=$(( _dp_inner_w - 18 ))
+                (( ${#_dp_rfp} > _dp_max_rf )) && _dp_rfp="…${_dp_rfp: -$((_dp_max_rf-1))}"
+                move_to $(( _dp_row + 5 + _dp_rfi )) 12
+                tui '%s%s%s  %s%s%s' "${bwhite}" "$_dp_rfp" "${reset}" "${dim}" "$_dp_age" "${reset}"
+                _dp_rfi=$(( _dp_rfi + 1 ))
+                (( _dp_rfi >= 3 )) && break
+            done <<< "$_dp_rf"
         fi
     fi
 
@@ -1678,7 +1911,8 @@ do_toggle_view() {
 
 do_toggle_sort() {
     case "$sort_mode" in
-        date)     sort_mode="recent" ;;
+        date)     sort_mode="modified" ;;
+        modified) sort_mode="recent" ;;
         recent)   sort_mode="name" ;;
         name)     sort_mode="language" ;;
         language) sort_mode="date" ;;
@@ -1713,19 +1947,37 @@ do_add_dir() {
     # Resolve to absolute path
     path=$(realpath "$path" 2>/dev/null) || path="$path"
 
+    # Ask: single project, or scan children?
+    local subdir_count
+    subdir_count=$(find "$path" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    local mode
+    if (( subdir_count >= 2 )); then
+        mode=$(prompt_input "Add as (s)ingle project, or (c)scan ${subdir_count} subdirs? [s/c]: " "c")
+    else
+        mode="s"
+    fi
+    local entry="$path"
+    if [[ "$mode" == "c" || "$mode" == "C" ]]; then
+        entry="$path/*"
+    fi
+
     # Check if already tracked
-    if [[ -f "$EXTRA_DIRS_FILE" ]] && grep -qx "$path" "$EXTRA_DIRS_FILE" 2>/dev/null; then
-        status_msg="Already tracked: $path"
+    if [[ -f "$EXTRA_DIRS_FILE" ]] && grep -qxF "$entry" "$EXTRA_DIRS_FILE" 2>/dev/null; then
+        status_msg="Already tracked: $entry"
         status_color="${byellow}${bold}"
         return
     fi
 
     # Append to extra dirs file
-    printf '%s\n' "$path" >> "$EXTRA_DIRS_FILE"
+    printf '%s\n' "$entry" >> "$EXTRA_DIRS_FILE"
     load_dirs
     _apply_groups_to_cache
     _apply_demo_mode
-    status_msg="Added: $path"
+    if [[ "$entry" == */\* ]]; then
+        status_msg="Scanning: $entry (${subdir_count} subdirs)"
+    else
+        status_msg="Added: $entry"
+    fi
     status_color="${bgreen}${bold}"
 }
 
@@ -2734,7 +2986,7 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  2.0.0' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  2.3.0' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     # Show last modified date + relative time of the installed script
@@ -2966,7 +3218,7 @@ _draw_settings() {
 
         # 2: Sort Mode
         _draw_setting_row "$row" "$(( sel == 2 ))" "Sort Mode" "$sort_mode" \
-            "date = modified  |  recent = last opened  |  name  |  language"
+            "date = encoded  |  modified = most recent file  |  recent = last opened  |  name  |  language"
         (( row += (sel == 2 ? 3 : 2) ))
 
         # 3: Demo Mode
@@ -3154,7 +3406,7 @@ do_settings() {
                     case "$settings_sel" in
                         0) view_mode=$(_cycle_value "$view_mode" 1 local all) ;;
                         1) display_mode=$(_cycle_value "$display_mode" 1 compact full grid) ;;
-                        2) sort_mode=$(_cycle_value "$sort_mode" 1 date recent name language) ;;
+                        2) sort_mode=$(_cycle_value "$sort_mode" 1 date modified recent name language) ;;
                         3) demo_mode=$(_cycle_value "$demo_mode" 1 off on) ;;
                     esac
                 else
@@ -3177,7 +3429,7 @@ do_settings() {
                     case "$settings_sel" in
                         0) view_mode=$(_cycle_value "$view_mode" -1 local all) ;;
                         1) display_mode=$(_cycle_value "$display_mode" -1 compact full grid) ;;
-                        2) sort_mode=$(_cycle_value "$sort_mode" -1 date recent name language) ;;
+                        2) sort_mode=$(_cycle_value "$sort_mode" -1 date modified recent name language) ;;
                         3) demo_mode=$(_cycle_value "$demo_mode" -1 off on) ;;
                     esac
                 else
@@ -3258,20 +3510,6 @@ do_shell() {
     action="shell"
 }
 
-_agent_install_hint() {
-    case "$1" in
-        claude)       echo "npm install -g @anthropic-ai/claude-code" ;;
-        opencode)     echo "curl -fsSL https://opencode.ai/install | sh" ;;
-        copilot)      echo "gh extension install github/gh-copilot" ;;
-        amp)          echo "curl -fsSL https://ampcode.com/install | sh" ;;
-        cursor-agent) echo "Install Cursor IDE from cursor.com" ;;
-        aider)        echo "pipx install aider-chat  (or: pip install aider-chat)" ;;
-        gemini)       echo "npm install -g @google/gemini-cli" ;;
-        codex)        echo "npm install -g @openai/codex" ;;
-        *)            echo "see the project's documentation" ;;
-    esac
-}
-
 do_open_with() {
     (( ${#filtered[@]} == 0 )) && return
     local idx="${filtered[$selected]}"
@@ -3299,7 +3537,7 @@ do_open_with() {
             move_to "$row" 1
             local a="${known_agents[$i]}"
             local suffix=""
-            command -v "$a" &>/dev/null || suffix="${bred}  (not installed)${reset}"
+            command -v "$a" &>/dev/null || suffix="${dim}  (not installed)${reset}"
             [[ "$a" == "$agent" ]] && suffix+="${dim}  [default]${reset}"
             if (( i == sel )); then
                 tui '  %s> %s%s%s%s' "${bgreen}${bold}" "${bg_sel}${bwhite}${bold}" "$a" "${reset}" "$suffix"
@@ -3325,24 +3563,7 @@ do_open_with() {
             $'\e[A' | k) (( sel > 0 )) && (( sel-- )) ;;
             $'\e[B' | j) (( sel < count - 1 )) && (( sel++ )) ;;
             "")
-                local chosen="${known_agents[$sel]}"
-                if ! command -v "$chosen" &>/dev/null; then
-                    # Show install hint — don't launch
-                    local hint
-                    hint=$(_agent_install_hint "$chosen")
-                    clear_screen
-                    move_to 2 1
-                    tui '  %s%s%s is not installed.\n' "${bold}${bred}" "$chosen" "${reset}"
-                    move_to 4 1
-                    tui '  %sInstall with:%s\n' "${bold}${bwhite}" "${reset}"
-                    move_to 5 1
-                    tui '    %s%s%s\n' "${bold}${byellow}" "$hint" "${reset}"
-                    move_to 7 1
-                    tui '  %sPress any key to go back...%s' "${dim}" "${reset}"
-                    read_key > /dev/null
-                    continue
-                fi
-                open_agent_override="$chosen"
+                open_agent_override="${known_agents[$sel]}"
                 open_force_run=true
                 do_open
                 return
@@ -3486,28 +3707,6 @@ _install_write_wrapper() {
 # Opens a project picker; selecting a project cd's into it and optionally runs an AI agent.
 _cm_launch_claude() {
     local title="\$1" mode="\$2" agent_cmd="\${3:-claude}"
-
-    # Guard: verify agent is installed before any terminal manipulation
-    if ! command -v "\$agent_cmd" &>/dev/null; then
-        printf '\\n\\e[31m[error]\\e[0m  Agent not found: %s\\n' "\$agent_cmd"
-        local _hint
-        case "\$agent_cmd" in
-            claude)       _hint="npm install -g @anthropic-ai/claude-code" ;;
-            opencode)     _hint="curl -fsSL https://opencode.ai/install | sh" ;;
-            copilot)      _hint="gh extension install github/gh-copilot" ;;
-            amp)          _hint="curl -fsSL https://ampcode.com/install | sh" ;;
-            cursor-agent) _hint="Install Cursor IDE from cursor.com" ;;
-            aider)        _hint="pipx install aider-chat" ;;
-            gemini)       _hint="npm install -g @google/gemini-cli" ;;
-            codex)        _hint="npm install -g @openai/codex" ;;
-            *)            _hint="see the project documentation" ;;
-        esac
-        printf '       Install:  %s\\n\\n' "\$_hint"
-        printf 'Press any key to continue... '
-        IFS= read -rsn1
-        printf '\\n'
-        return 1
-    fi
 
     # Always set the terminal window/tab title (non-intrusive, works everywhere)
     if [[ -n "\$title" ]]; then
