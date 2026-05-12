@@ -76,6 +76,29 @@ _mouse_grid_cols=1
 _mouse_cell_width=24
 _mouse_cell_height=2
 _mouse_display_mode=""
+_mouse_btn_rows=()
+_mouse_btn_starts=()
+_mouse_btn_ends=()
+_mouse_btn_keys=()
+_btn_col=0
+
+# Render a clickable keybinding chip on the current draw's row 2 at $_btn_col.
+# Args: letter, description, key-to-dispatch, bg-color, fg-color
+_draw_btn() {
+    local letter="$1" desc="$2" key="$3" bg="$4" fg="$5"
+    local row=2
+    local chip=" $letter "
+    local tail=" $desc  "
+    move_to "$row" "$_btn_col"
+    tui '%s%s%s%s%s%s' "$bg" "$fg" "$chip" "${reset}${dim}" "$tail" "${reset}"
+    local start_col=$_btn_col
+    local end_col=$(( _btn_col + ${#chip} + ${#tail} - 1 ))
+    _mouse_btn_rows+=("$row")
+    _mouse_btn_starts+=("$start_col")
+    _mouse_btn_ends+=("$end_col")
+    _mouse_btn_keys+=("$key")
+    _btn_col=$(( end_col + 1 ))
+}
 show_cursor()  { tui '\e[?25h'; }
 move_to()      { tui '\e[%d;%dH' "$1" "$2"; }
 clear_screen() { tui '\e[2J\e[H'; }
@@ -1236,7 +1259,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.4.1 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.4.2 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -1250,27 +1273,26 @@ draw() {
     [[ "$display_mode" != "full" ]] && mode_label=" | $display_mode"
     tui '  %s[%s | sort:%s%s]%s' "${dim}${italic}" "$view_label" "$sort_mode" "$mode_label" "${reset}"
 
-    # Keybindings bar
-    move_to 2 1
-    tui '  '
-    tui '%s enter %s open  '    "${bg_gray}${bwhite}${bold}"   "${reset}${dim}"
-    tui '%s A %s open with  '   "${bg_magenta}${white}${bold}" "${reset}${dim}"
-    tui '%s / %s search  '      "${bg_bblue}${white}${bold}"   "${reset}${dim}"
-    tui '%s n %s new  '         "${bg_green}${black}${bold}"    "${reset}${dim}"
-    tui '%s p %s all  '         "${bg_cyan}${black}${bold}"     "${reset}${dim}"
-    tui '%s t %s sort  '        "${bg_yellow}${black}${bold}"   "${reset}${dim}"
-    tui '%s c %s view  '          "${bg_yellow}${black}${bold}"   "${reset}${dim}"
-    tui '%s a %s add  '         "${bg_green}${black}${bold}"  "${reset}${dim}"
-    tui '%s R %s rename  '       "${bg_cyan}${black}${bold}"     "${reset}${dim}"
-    tui '%s f %s refresh  '     "${bg_magenta}${white}${bold}" "${reset}${dim}"
-    tui '%s g %s group  '       "${bg_green}${black}${bold}"     "${reset}${dim}"
-    tui '%s # %s auto-grp  '    "${bg_magenta}${white}${bold}"  "${reset}${dim}"
-    tui '%s S %s stats  '       "${bg_cyan}${black}${bold}"     "${reset}${dim}"
-    tui '%s d %s del  '         "${bg_red}${white}${bold}"      "${reset}${dim}"
-    tui '%s , %s settings  '    "${bg_gray}${bwhite}${bold}"    "${reset}${dim}"
-    tui '%s ? %s about  '       "${bg_gray}${bwhite}${bold}"    "${reset}${dim}"
-    tui '%s q %s quit'          "${bg_gray}${bwhite}${bold}"    "${reset}${dim}"
-    tui '%s' "${reset}"
+    # Keybindings bar — drawn via _draw_btn so clicks map back to keys
+    _mouse_btn_rows=(); _mouse_btn_starts=(); _mouse_btn_ends=(); _mouse_btn_keys=()
+    _btn_col=2
+    _draw_btn "enter"  "open"      ""  "${bg_gray}"    "${bwhite}${bold}"
+    _draw_btn "A"      "open with" "A" "${bg_magenta}" "${white}${bold}"
+    _draw_btn "/"      "search"    "/" "${bg_bblue}"   "${white}${bold}"
+    _draw_btn "n"      "new"       "n" "${bg_green}"   "${black}${bold}"
+    _draw_btn "p"      "all"       "p" "${bg_cyan}"    "${black}${bold}"
+    _draw_btn "t"      "sort"      "t" "${bg_yellow}"  "${black}${bold}"
+    _draw_btn "c"      "view"      "c" "${bg_yellow}"  "${black}${bold}"
+    _draw_btn "a"      "add"       "a" "${bg_green}"   "${black}${bold}"
+    _draw_btn "R"      "rename"    "R" "${bg_cyan}"    "${black}${bold}"
+    _draw_btn "f"      "refresh"   "f" "${bg_magenta}" "${white}${bold}"
+    _draw_btn "g"      "group"     "g" "${bg_green}"   "${black}${bold}"
+    _draw_btn "#"      "auto-grp"  "#" "${bg_magenta}" "${white}${bold}"
+    _draw_btn "S"      "stats"     "S" "${bg_cyan}"    "${black}${bold}"
+    _draw_btn "d"      "del"       "d" "${bg_red}"     "${white}${bold}"
+    _draw_btn ","      "settings"  "," "${bg_gray}"    "${bwhite}${bold}"
+    _draw_btn "?"      "about"     "?" "${bg_gray}"    "${bwhite}${bold}"
+    _draw_btn "q"      "quit"      "q" "${bg_gray}"    "${bwhite}${bold}"
 
     # Search bar (if active)
     local header_end=3
@@ -3057,7 +3079,7 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  2.4.1' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  2.4.2' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     # Show last modified date + relative time of the installed script
@@ -4025,8 +4047,20 @@ main() {
                     ;;
                 0) # left button
                     if [[ "$_act" == "M" ]]; then
-                        # Map click to item index
-                        local _cidx=-1
+                        # Check keybinding-bar buttons first
+                        local _bi _btn_match=0 _btn_hit_key=""
+                        for (( _bi = 0; _bi < ${#_mouse_btn_rows[@]}; _bi++ )); do
+                            if (( _row == _mouse_btn_rows[_bi] && _col >= _mouse_btn_starts[_bi] && _col <= _mouse_btn_ends[_bi] )); then
+                                _btn_match=1
+                                _btn_hit_key="${_mouse_btn_keys[$_bi]}"
+                                break
+                            fi
+                        done
+                        if (( _btn_match == 1 )); then
+                            key="$_btn_hit_key"
+                        else
+                            # Map click to item index
+                            local _cidx=-1
                         if [[ "$_mouse_display_mode" == "grid" ]]; then
                             local _gr=$(( (_row - _mouse_list_start) / _mouse_cell_height ))
                             local _gc=$(( (_col - 2) / _mouse_cell_width ))
@@ -4045,6 +4079,7 @@ main() {
                             fi
                         else
                             continue
+                        fi
                         fi
                     else
                         continue
