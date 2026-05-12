@@ -16,7 +16,7 @@ CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
 EXTRA_DIRS_FILE="$CLAUDE_BASE/.claudemanager_dirs"
 IGNORE_FILE="$CLAUDE_BASE/.claudemanager_ignore"
 CACHE_FILE="$CLAUDE_BASE/.claudemanager_cache"
-CACHE_SCHEMA="6"  # bump when _compute_title/_compute_* output format changes
+CACHE_SCHEMA="7"  # bump when _compute_title/_compute_* output format changes
 BUILD_DATE=$(stat -f '%Sm' -t '%Y-%m-%d' "${BASH_SOURCE[0]}" 2>/dev/null || date '+%Y-%m-%d')
 DIRLIST_CACHE="$CLAUDE_BASE/.claudemanager_dirlist"
 PREFS_FILE="$CLAUDE_BASE/.claudemanager_prefs"
@@ -893,7 +893,9 @@ _cache_one_dir() {
             if [[ "$_ts_dir" == "true" || "$c_mtime" == "$dir_mtime" ]]; then
                 cache_title+=("$c_title")
                 cache_date+=("$c_date")
-                _epoch_to_reldate "$c_epoch" "$now_epoch"
+                local _eff_ep="$c_epoch"
+                (( ${c_recent:-0} > _eff_ep )) && _eff_ep="${c_recent:-0}"
+                _epoch_to_reldate "$_eff_ep" "$now_epoch"
                 cache_reldate+=("$_reldate")
                 cache_desc+=("$c_desc")
                 cache_files+=("$c_files")
@@ -911,10 +913,14 @@ _cache_one_dir() {
     # Cache miss - compute everything
     cache_title+=("$(_compute_title "$d")")
     cache_date+=("$(_compute_date "$d")")
-    local ep
+    local ep rec
     ep=$(_compute_epoch "$d")
     cache_epoch+=("$ep")
-    _epoch_to_reldate "$ep" "$now_epoch"
+    rec=$(_compute_recent "$d")
+    cache_recent+=("$rec")
+    local _eff_ep="$ep"
+    (( ${rec:-0} > _eff_ep )) && _eff_ep="$rec"
+    _epoch_to_reldate "$_eff_ep" "$now_epoch"
     cache_reldate+=("$_reldate")
     cache_desc+=("$(_compute_desc "$d")")
     cache_files+=("$(_compute_filecount "$d")")
@@ -924,7 +930,6 @@ _cache_one_dir() {
     cache_lang+=("$_lang_name")
     cache_langcolor+=("$_lang_color")
     cache_framework+=("$_framework")
-    cache_recent+=("$(_compute_recent "$d")")
 }
 
 # ── Load & cache everything ───────────────────────────────────────
@@ -1231,7 +1236,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.4.0 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.4.1 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -3052,7 +3057,7 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  2.4.0' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  2.4.1' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     # Show last modified date + relative time of the installed script
