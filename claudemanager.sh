@@ -1288,7 +1288,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.5.0 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.5.1 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -3305,6 +3305,186 @@ _tmux_display_value() {
     esac
 }
 
+# ── Claude helpers install/uninstall ──────────────────────────────
+_helpers_bin_dir() { printf '%s/bin' "$HOME"; }
+
+_helpers_list() { printf 'claude-yolo claude-edits claude-pin claude-help'; }
+
+_helpers_status() {
+    local bin_dir
+    bin_dir=$(_helpers_bin_dir)
+    local found=0 total=4
+    local h
+    for h in $(_helpers_list); do
+        [[ -x "$bin_dir/$h" ]] && (( found++ ))
+    done
+    if (( found == 0 )); then
+        printf 'not installed'
+    elif (( found == total )); then
+        printf 'installed'
+    else
+        printf 'partial (%d/%d)' "$found" "$total"
+    fi
+}
+
+_install_claude_helpers() {
+    local bin_dir
+    bin_dir=$(_helpers_bin_dir)
+    mkdir -p "$bin_dir"
+
+    cat > "$bin_dir/claude-yolo" <<'END_YOLO'
+#!/usr/bin/env bash
+# claude-yolo — launch Claude Code with bypassPermissions + safety denies
+show_help() {
+  cat <<'HELP'
+claude-yolo — Launch Claude Code with all prompts disabled (with guardrails)
+
+USAGE
+  claude-yolo [claude-args...]
+
+WHAT IT DOES
+  Auto-approves every Bash command and file edit, except for a deny list
+  that blocks obvious foot-guns (rm, sudo, git push, .env, .ssh, etc.).
+  Nothing written to disk — session-only settings.
+
+SEE ALSO
+  claude-edits  safer: auto-accept edits only, Bash still prompts
+  claude-pin    write yolo settings into ./.claude/ permanently
+  claude-help   overview of all helpers
+HELP
+}
+case "${1:-}" in -h|--help) show_help; exit 0 ;; esac
+exec claude --settings '{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash(rm:*)", "Bash(sudo:*)", "Bash(git push:*)",
+      "Read(**/.env)", "Read(**/.env.*)",
+      "Read(**/.ssh/**)", "Read(**/.aws/**)",
+      "Read(**/id_rsa*)", "Read(**/*.pem)"
+    ]
+  }
+}' "$@"
+END_YOLO
+
+    cat > "$bin_dir/claude-edits" <<'END_EDITS'
+#!/usr/bin/env bash
+# claude-edits — Claude Code with acceptEdits (Bash still prompts)
+show_help() {
+  cat <<'HELP'
+claude-edits — Launch Claude Code in acceptEdits mode
+
+File edits auto-approve; Bash commands still prompt as usual.
+The safer middle ground between default and claude-yolo.
+HELP
+}
+case "${1:-}" in -h|--help) show_help; exit 0 ;; esac
+exec claude --settings '{"permissions":{"defaultMode":"acceptEdits"}}' "$@"
+END_EDITS
+
+    cat > "$bin_dir/claude-pin" <<'END_PIN'
+#!/usr/bin/env bash
+# claude-pin — persist yolo settings into ./.claude/settings.local.json
+set -euo pipefail
+FORCE=0
+case "${1:-}" in
+  -h|--help)
+    echo "claude-pin — Persist bypassPermissions to ./.claude/settings.local.json"
+    echo "Usage: claude-pin [--force]"
+    exit 0 ;;
+  --force) FORCE=1 ;;
+  "") ;;
+  *) echo "Unknown arg: $1 (try --help)" >&2; exit 1 ;;
+esac
+TARGET=".claude/settings.local.json"
+if [[ -f "$TARGET" && $FORCE -eq 0 ]]; then
+  echo "Refusing to overwrite existing $TARGET (use --force)." >&2; exit 1
+fi
+mkdir -p .claude
+cat > "$TARGET" <<'JSON'
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash(rm:*)", "Bash(sudo:*)", "Bash(git push:*)",
+      "Read(**/.env)", "Read(**/.env.*)",
+      "Read(**/.ssh/**)", "Read(**/.aws/**)",
+      "Read(**/id_rsa*)", "Read(**/*.pem)"
+    ]
+  }
+}
+JSON
+echo "Pinned yolo settings to $(pwd)/$TARGET"
+END_PIN
+
+    cat > "$bin_dir/claude-help" <<'END_HELP'
+#!/usr/bin/env bash
+# claude-help — overview of all installed Claude Code helpers
+cat <<'HELP'
+Claude Code helper commands
+═══════════════════════════
+
+  claude-yolo    Launch with all prompts disabled (with safety denies).
+                 Session-only; nothing written to disk.
+
+  claude-edits   Launch with file edits auto-approved, Bash still prompts.
+                 The safer middle ground.
+
+  claude-pin     Persist yolo-style settings into ./.claude/ for the
+                 current project. After this, plain `claude` inherits it.
+
+  claude-help    This screen.
+
+Quick reference
+───────────────
+  Prompts for everything:  claude
+  Prompts only for Bash:   claude-edits
+  Prompts for nothing*:    claude-yolo            (* with deny list)
+  Make it sticky:          claude-pin
+
+Deny list (applied by claude-yolo / claude-pin)
+────────────────────────────────────────────────
+  Bash:  rm, sudo, git push
+  Read:  .env, .env.*, .ssh/**, .aws/**, id_rsa*, *.pem
+
+Edit scripts in ~/bin/ to adjust the deny list to your taste.
+HELP
+END_HELP
+
+    chmod +x "$bin_dir"/claude-{yolo,edits,pin,help}
+
+    # Ensure ~/bin is on PATH hint
+    local path_ok=false
+    [[ ":$PATH:" == *":$bin_dir:"* ]] && path_ok=true
+
+    _settings_status="Claude helpers installed to $bin_dir"
+    _settings_status_color="${bgreen}${bold}"
+    if ! $path_ok; then
+        _settings_status+="  (add $bin_dir to PATH)"
+        _settings_status_color="${byellow}${bold}"
+    fi
+}
+
+_uninstall_claude_helpers() {
+    local bin_dir
+    bin_dir=$(_helpers_bin_dir)
+    local removed=0
+    local h
+    for h in $(_helpers_list); do
+        if [[ -f "$bin_dir/$h" ]]; then
+            rm -f "$bin_dir/$h"
+            (( removed++ ))
+        fi
+    done
+    if (( removed > 0 )); then
+        _settings_status="Removed $removed helper(s) from $bin_dir"
+        _settings_status_color="${bgreen}${bold}"
+    else
+        _settings_status="No helpers found to remove"
+        _settings_status_color="${dim}"
+    fi
+}
+
 _draw_setting_row() {
     # Draw a single setting row with label, value, description, and optional highlight
     local row="$1" is_selected="$2" label="$3" value="$4" desc="$5" val_color="${6:-}"
@@ -3429,6 +3609,19 @@ _draw_settings() {
         # 3: Match Threshold
         _draw_setting_row "$row" "$(( sel == 3 ))" "Quick-open Threshold" "${match_threshold}%" \
             "Minimum similarity % for instant open (0-100, higher = stricter)"
+        (( row += (sel == 3 ? 3 : 2) ))
+
+        # 4: Claude Helpers
+        local _helpers_val
+        _helpers_val=$(_helpers_status)
+        local _helpers_color=""
+        case "$_helpers_val" in
+            installed)   _helpers_color="${bgreen}${bold}" ;;
+            "not installed") _helpers_color="${dim}" ;;
+            partial*)    _helpers_color="${byellow}${bold}" ;;
+        esac
+        _draw_setting_row "$row" "$(( sel == 4 ))" "Claude Helpers" "$_helpers_val" \
+            "claude-yolo  claude-edits  claude-pin  claude-help  (in ~/bin/)" "$_helpers_color"
     fi
 
     # Status message
@@ -3445,6 +3638,15 @@ _draw_settings() {
     tui '%s tab %s page %d/2  ' "${bg_cyan}${black}${bold}" "${reset}${dim}" "$page"
     if (( page == 2 && sel == 0 )) && ! _has_tmux; then
         tui '%s i %s install tmux  ' "${bg_green}${black}${bold}" "${reset}${dim}"
+    fi
+    if (( page == 2 && sel == 4 )); then
+        local _hstat
+        _hstat=$(_helpers_status)
+        if [[ "$_hstat" == "installed" ]]; then
+            tui '%s u %s uninstall helpers  ' "${bg_red}${white}${bold}" "${reset}${dim}"
+        else
+            tui '%s i %s install helpers  ' "${bg_green}${black}${bold}" "${reset}${dim}"
+        fi
     fi
     if (( page == 2 )); then
         tui '%s x %s export  ' "${bg_cyan}${black}${bold}" "${reset}${dim}"
@@ -3514,7 +3716,7 @@ do_settings() {
     local settings_sel=0
     local settings_page=1
     local page1_count=4   # View Mode, Display Mode, Sort Mode, Demo Mode
-    local page2_count=4   # Title Persistence, AI Agent, Auto-launch Agent, Match Threshold
+    local page2_count=5   # Title Persistence, AI Agent, Auto-launch Agent, Match Threshold, Claude Helpers
     _settings_status=""
     _settings_status_color=""
 
@@ -3604,6 +3806,20 @@ do_settings() {
             i|I)
                 if (( settings_page == 2 && settings_sel == 0 )) && ! _has_tmux; then
                     _install_tmux
+                elif (( settings_page == 2 && settings_sel == 4 )); then
+                    _install_claude_helpers
+                fi
+                ;;
+            u|U)
+                if (( settings_page == 2 && settings_sel == 4 )); then
+                    local _hstat
+                    _hstat=$(_helpers_status)
+                    if [[ "$_hstat" == "installed" || "$_hstat" == partial* ]]; then
+                        _uninstall_claude_helpers
+                    else
+                        _settings_status="Helpers not installed — press i to install"
+                        _settings_status_color="${dim}"
+                    fi
                 fi
                 ;;
             x|X) (( settings_page == 2 )) && _export_prefs ;;
