@@ -380,6 +380,34 @@ declare -a cache_fullpath=()   # full path for display on external dirs
 declare -a cache_mtime=()      # directory mtime (for save without re-stat)
 declare -a cache_recent=()     # max mtime of any file in the tree (for "modified" sort)
 declare -a cache_group=()      # group/client name per project
+
+# ── Active harness sessions ────────────────────────────────────────
+declare -A _session_status=()   # cwd -> status string ("waiting"|"running"|"idle")
+declare -A _session_waiting=()  # cwd -> waitingFor string (if any)
+
+_refresh_sessions() {
+    _session_status=()
+    _session_waiting=()
+    local sessions_dir="$HOME/.claude/sessions"
+    [[ -d "$sessions_dir" ]] || return 0
+    local jf
+    for jf in "$sessions_dir"/*.json; do
+        [[ -f "$jf" ]] || continue
+        local cwd="" status="" waitingFor="" pid=""
+        # Parse JSON fields with awk (no jq dependency)
+        while IFS= read -r line; do
+            [[ "$line" =~ \"cwd\":\"([^\"]+)\" ]]        && cwd="${BASH_REMATCH[1]}"
+            [[ "$line" =~ \"status\":\"([^\"]+)\" ]]     && status="${BASH_REMATCH[1]}"
+            [[ "$line" =~ \"waitingFor\":\"([^\"]+)\" ]] && waitingFor="${BASH_REMATCH[1]}"
+            [[ "$line" =~ \"pid\":([0-9]+) ]]            && pid="${BASH_REMATCH[1]}"
+        done < "$jf"
+        [[ -z "$cwd" || -z "$status" ]] && continue
+        # Verify process is actually alive
+        [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null && continue
+        _session_status["$cwd"]="$status"
+        _session_waiting["$cwd"]="$waitingFor"
+    done
+}
 declare -A group_map=()        # group_map["path"] = "group_name"
 
 _load_groups
@@ -1240,6 +1268,7 @@ refresh_cache() {
 
 # ── Drawing ───────────────────────────────────────────────────────
 draw() {
+    _refresh_sessions
     local term_lines term_cols
     term_lines=$(tput_lines)
     term_cols=$(tput_cols)
@@ -1259,7 +1288,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.4.2 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.5.0 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -1467,6 +1496,17 @@ draw() {
                 if [[ -n "${cache_group[$idx]:-}" ]]; then
                     tui '  %s{%s}%s' "${dim}${bmagenta}" "${cache_group[$idx]}" "${reset}"
                 fi
+                # Harness status badge
+                local _sess_stat="${_session_status[$fullpath]:-}"
+                if [[ -n "$_sess_stat" ]]; then
+                    local _sess_wait="${_session_waiting[$fullpath]:-}"
+                    case "$_sess_stat" in
+                        waiting) tui '  %s●%s %s%s' "${byellow}${bold}" "${reset}${dim}" "${_sess_wait:-waiting}" "${reset}" ;;
+                        running) tui '  %s●%s %srunning%s' "${bgreen}${bold}" "${reset}${dim}" "" "${reset}" ;;
+                        idle)    tui '  %s●%s %sidle%s'    "${dim}"         "${reset}${dim}" "" "${reset}" ;;
+                        *)       tui '  %s●%s %s%s'        "${dim}"         "${reset}${dim}" "$_sess_stat" "${reset}" ;;
+                    esac
+                fi
             else
                 # ── FULL MODE: 3 rows per project ──
 
@@ -1487,6 +1527,19 @@ draw() {
                     display_path="${fullpath/#$HOME/~}"
                 fi
 
+                # Compute harness badge once for both selected/unselected
+                local _sess_badge=""
+                local _fp_stat="${_session_status[$fullpath]:-}"
+                if [[ -n "$_fp_stat" ]]; then
+                    local _fp_wait="${_session_waiting[$fullpath]:-}"
+                    case "$_fp_stat" in
+                        waiting) _sess_badge="  ${byellow}${bold}●${reset}${dim} ${_fp_wait:-waiting}${reset}" ;;
+                        running) _sess_badge="  ${bgreen}${bold}●${reset}${dim} running${reset}" ;;
+                        idle)    _sess_badge="  ${dim}● idle${reset}" ;;
+                        *)       _sess_badge="  ${dim}● ${_fp_stat}${reset}" ;;
+                    esac
+                fi
+
                 if (( fidx == selected )); then
                     # ── SELECTED ──
                     move_to "$row" 1
@@ -1500,6 +1553,7 @@ draw() {
                         tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
                     fi
                     tui '%s' "$source_badge"
+                    [[ -n "$_sess_badge" ]] && tui '%s' "$_sess_badge"
 
                     move_to $(( row + 1 )) 1
                     if [[ "$desc" != "$title" ]]; then
@@ -1528,6 +1582,7 @@ draw() {
                         tui ' %s%s%s' "${dim}${italic}" "$framework" "${reset}"
                     fi
                     tui '%s' "$source_badge"
+                    [[ -n "$_sess_badge" ]] && tui '%s' "$_sess_badge"
 
                     move_to $(( row + 1 )) 1
                     if [[ "$desc" != "$title" ]]; then
@@ -3607,7 +3662,7 @@ do_open_with() {
     (( ${#filtered[@]} == 0 )) && return
     local idx="${filtered[$selected]}"
     local title="${cache_title[$idx]}"
-    local -a known_agents=(claude opencode copilot amp cursor-agent aider gemini codex)
+    local -a known_agents=(claude claude-yolo claude-edits opencode copilot amp cursor-agent aider gemini codex)
 
     local sel=0
     local count=${#known_agents[@]}
