@@ -1295,7 +1295,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.5.2 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.5.3 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -3887,10 +3887,58 @@ do_shell() {
     action="shell"
 }
 
+_agent_desc() {
+    case "$1" in
+        claude)       printf 'Anthropic Claude Code — official CLI' ;;
+        claude-yolo)  printf 'Claude with all prompts bypassed (+ safety deny list)' ;;
+        claude-edits) printf 'Claude with file edits auto-approved; Bash still prompts' ;;
+        opencode)     printf 'OpenCode — open-source AI coding assistant' ;;
+        copilot)      printf 'GitHub Copilot in the CLI (gh extension)' ;;
+        amp)          printf 'Amp by Sourcegraph — AI pair programmer' ;;
+        cursor-agent) printf 'Cursor IDE agent mode' ;;
+        aider)        printf 'Aider — AI pair programmer in your terminal' ;;
+        gemini)       printf 'Google Gemini CLI' ;;
+        codex)        printf 'OpenAI Codex CLI' ;;
+        *)            printf '' ;;
+    esac
+}
+
+_agent_install_cmd() {
+    case "$1" in
+        claude)       printf 'npm install -g @anthropic-ai/claude-code' ;;
+        claude-yolo)  printf 'claudemanager , → tab → Claude Helpers → i' ;;
+        claude-edits) printf 'claudemanager , → tab → Claude Helpers → i' ;;
+        opencode)     printf 'curl -fsSL https://opencode.ai/install | sh' ;;
+        copilot)      printf 'gh extension install github/gh-copilot' ;;
+        amp)          printf 'curl -fsSL https://ampcode.com/install | sh' ;;
+        cursor-agent) printf 'Install Cursor IDE — cursor.com' ;;
+        aider)        printf 'pipx install aider-chat' ;;
+        gemini)       printf 'npm install -g @google/gemini-cli' ;;
+        codex)        printf 'npm install -g @openai/codex' ;;
+        *)            printf 'see project documentation' ;;
+    esac
+}
+
+# Approximate token usage for a project directory from its JSONL conversation files
+_project_usage_summary() {
+    local proj_dir="$1"
+    awk '
+    /\"inputTokens"/ { match($0,/"inputTokens":([0-9]+)/,a); in_tok+=a[1] }
+    /\"outputTokens"/ { match($0,/"outputTokens":([0-9]+)/,a); out_tok+=a[1] }
+    END {
+        total = in_tok + out_tok
+        if (total == 0) { print "no usage data"; exit }
+        if (total >= 1000000) printf "%.1fM tokens (%dk in · %dk out)", total/1000000, in_tok/1000, out_tok/1000
+        else if (total >= 1000) printf "%dk tokens (%dk in · %dk out)", total/1000, in_tok/1000, out_tok/1000
+        else printf "%d tokens", total
+    }' <(find "$proj_dir" -name '*.jsonl' -type f 2>/dev/null | xargs cat 2>/dev/null)
+}
+
 do_open_with() {
     (( ${#filtered[@]} == 0 )) && return
     local idx="${filtered[$selected]}"
     local title="${cache_title[$idx]}"
+    local fullpath="${cache_fullpath[$idx]}"
     local -a known_agents=(claude claude-yolo claude-edits opencode copilot amp cursor-agent aider gemini codex)
 
     local sel=0
@@ -3900,6 +3948,10 @@ do_open_with() {
         [[ "${known_agents[$i]}" == "$agent" ]] && sel=$i && break
     done
 
+    # Compute project usage once (can be slow on large projects, so do it outside the loop)
+    local proj_usage
+    proj_usage=$(_project_usage_summary "$fullpath")
+
     while true; do
         clear_screen
         local term_lines term_cols
@@ -3908,24 +3960,47 @@ do_open_with() {
         local row=2
         move_to "$row" 1
         tui '  %sOpen in agent:%s  %s%s%s' "${bold}${bwhite}" "${reset}" "${bold}${bcyan}" "$title" "${reset}"
+        if [[ -n "$proj_usage" ]]; then
+            tui '   %s%s%s' "${dim}" "$proj_usage" "${reset}"
+        fi
         (( row += 2 ))
 
         for (( i=0; i<count; i++ )); do
             move_to "$row" 1
             local a="${known_agents[$i]}"
-            local suffix=""
-            command -v "$a" &>/dev/null || suffix="${dim}  (not installed)${reset}"
-            [[ "$a" == "$agent" ]] && suffix+="${dim}  [default]${reset}"
+            local is_installed=false
+            command -v "$a" &>/dev/null && is_installed=true
+
+            local tag=""
+            $is_installed || tag="${bred}  not installed${reset}"
+            [[ "$a" == "$agent" ]] && tag+="${dim}  [default]${reset}"
+
+            local desc
+            desc=$(_agent_desc "$a")
+
             if (( i == sel )); then
-                tui '  %s> %s%s%s%s' "${bgreen}${bold}" "${bg_sel}${bwhite}${bold}" "$a" "${reset}" "$suffix"
-            else
-                if command -v "$a" &>/dev/null; then
-                    tui '    %s%s%s%s' "${bwhite}" "$a" "${reset}" "$suffix"
-                else
-                    tui '    %s%s%s%s' "${dim}" "$a" "${reset}" "$suffix"
+                tui '  %s> %s%s%s%s' "${bgreen}${bold}" "${bg_sel}${bwhite}${bold}" "$a" "${reset}" "$tag"
+                (( row++ ))
+                # Description line
+                move_to "$row" 1
+                tui '      %s%s%s' "${dim}" "$desc" "${reset}"
+                (( row++ ))
+                # Install hint if not installed
+                if ! $is_installed; then
+                    move_to "$row" 1
+                    local install_cmd
+                    install_cmd=$(_agent_install_cmd "$a")
+                    tui '      %s$ %s%s%s' "${byellow}" "${reset}${yellow}" "$install_cmd" "${reset}"
+                    (( row++ ))
                 fi
+            else
+                if $is_installed; then
+                    tui '    %s%s%s  %s%s%s' "${bwhite}" "$a" "${reset}" "${dim}" "$desc" "${reset}"
+                else
+                    tui '    %s%s%s  %s%s%s' "${dim}" "$a" "${reset}${dim}" "  (not installed)" "${reset}"
+                fi
+                (( row++ ))
             fi
-            (( row++ ))
         done
 
         move_to "$term_lines" 1
