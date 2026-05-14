@@ -1295,7 +1295,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.5.4 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.5.5 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -3936,7 +3936,9 @@ do_new_with() {
             $'\e[A' | k) (( sel > 0 )) && (( sel-- )) ;;
             $'\e[B' | j) (( sel < count - 1 )) && (( sel++ )) ;;
             "")
-                open_agent_override="${known_agents[$sel]}"
+                local _chosen="${known_agents[$sel]}"
+                _ensure_agent_installed "$_chosen" || continue
+                open_agent_override="$_chosen"
                 action="new"
                 return
                 ;;
@@ -3957,6 +3959,61 @@ do_shell() {
     open_dir="${dirs[$idx]}"
     _record_open "$open_dir"
     action="shell"
+}
+
+# Ensure an agent is installed, offering to install it if not.
+# Returns 0 if ready to use, 1 if not installed (user declined or install failed).
+_ensure_agent_installed() {
+    local a="$1"
+    command -v "$a" &>/dev/null && return 0
+
+    local install_cmd
+    install_cmd=$(_agent_install_cmd "$a")
+
+    local term_lines
+    term_lines=$(tput_lines)
+    move_to "$term_lines" 1
+    clear_line
+    show_cursor
+    tui '  %s%s%s not installed. Install now? [y/N] ' "${byellow}${bold}" "$a" "${reset}"
+    local answer
+    IFS= read -rsn1 answer < /dev/tty
+    hide_cursor
+
+    [[ "$answer" != "y" && "$answer" != "Y" ]] && return 1
+
+    clear_screen
+    move_to 1 1
+    show_cursor
+    tui '%s  Installing %s...%s\n\n' "${bwhite}${bold}" "$a" "${reset}"
+
+    local ok=false
+    case "$a" in
+        claude-yolo|claude-edits|claude-pin|claude-help)
+            _install_claude_helpers
+            command -v "$a" &>/dev/null && ok=true
+            ;;
+        *)
+            if eval "$install_cmd" < /dev/tty; then
+                # rehash so the shell finds the new binary
+                hash -r 2>/dev/null || true
+                command -v "$a" &>/dev/null && ok=true
+            fi
+            ;;
+    esac
+
+    hide_cursor
+    if $ok; then
+        tui '\n%s  %s installed successfully!%s\n' "${bgreen}${bold}" "$a" "${reset}"
+        sleep 1
+        return 0
+    else
+        tui '\n%s  Install may have failed. Try manually:%s\n  %s%s%s\n' \
+            "${bred}${bold}" "${reset}" "${dim}" "$install_cmd" "${reset}"
+        tui '%s  Press any key...%s' "${dim}" "${reset}"
+        IFS= read -rsn1 < /dev/tty
+        return 1
+    fi
 }
 
 _agent_desc() {
@@ -4087,7 +4144,9 @@ do_open_with() {
             $'\e[A' | k) (( sel > 0 )) && (( sel-- )) ;;
             $'\e[B' | j) (( sel < count - 1 )) && (( sel++ )) ;;
             "")
-                open_agent_override="${known_agents[$sel]}"
+                local _chosen="${known_agents[$sel]}"
+                _ensure_agent_installed "$_chosen" || continue
+                open_agent_override="$_chosen"
                 open_force_run=true
                 do_open
                 return
