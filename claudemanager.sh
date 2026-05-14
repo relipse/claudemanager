@@ -81,19 +81,26 @@ _mouse_btn_starts=()
 _mouse_btn_ends=()
 _mouse_btn_keys=()
 _btn_col=0
+_btn_row=2
+_btn_max_col=9999
 
-# Render a clickable keybinding chip on the current draw's row 2 at $_btn_col.
+# Render a clickable keybinding chip, wrapping to the next row when needed.
 # Args: letter, description, key-to-dispatch, bg-color, fg-color
 _draw_btn() {
     local letter="$1" desc="$2" key="$3" bg="$4" fg="$5"
-    local row=2
     local chip=" $letter "
     local tail=" $desc  "
-    move_to "$row" "$_btn_col"
+    local btn_width=$(( ${#chip} + ${#tail} ))
+    # Wrap to next row when this button would overflow the terminal width
+    if (( _btn_col + btn_width > _btn_max_col && _btn_col > 2 )); then
+        (( _btn_row++ ))
+        _btn_col=2
+    fi
+    move_to "$_btn_row" "$_btn_col"
     tui '%s%s%s%s%s%s' "$bg" "$fg" "$chip" "${reset}${dim}" "$tail" "${reset}"
     local start_col=$_btn_col
-    local end_col=$(( _btn_col + ${#chip} + ${#tail} - 1 ))
-    _mouse_btn_rows+=("$row")
+    local end_col=$(( _btn_col + btn_width - 1 ))
+    _mouse_btn_rows+=("$_btn_row")
     _mouse_btn_starts+=("$start_col")
     _mouse_btn_ends+=("$end_col")
     _mouse_btn_keys+=("$key")
@@ -1288,7 +1295,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.5.1 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.5.2 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -1303,8 +1310,11 @@ draw() {
     tui '  %s[%s | sort:%s%s]%s' "${dim}${italic}" "$view_label" "$sort_mode" "$mode_label" "${reset}"
 
     # Keybindings bar — drawn via _draw_btn so clicks map back to keys
+    # Wraps to a second line automatically when terminal is too narrow.
     _mouse_btn_rows=(); _mouse_btn_starts=(); _mouse_btn_ends=(); _mouse_btn_keys=()
+    _btn_row=2
     _btn_col=2
+    _btn_max_col=$(( term_cols - 1 ))
     _draw_btn "enter"  "open"      ""  "${bg_gray}"    "${bwhite}${bold}"
     _draw_btn "A"      "open with" "A" "${bg_magenta}" "${white}${bold}"
     _draw_btn "/"      "search"    "/" "${bg_bblue}"   "${white}${bold}"
@@ -1323,15 +1333,18 @@ draw() {
     _draw_btn "?"      "about"     "?" "${bg_gray}"    "${bwhite}${bold}"
     _draw_btn "q"      "quit"      "q" "${bg_gray}"    "${bwhite}${bold}"
 
+    # header_end = row after the last button row (= separator row)
+    local _sep_row=$(( _btn_row + 1 ))
+    local header_end="$_sep_row"
+
     # Search bar (if active)
-    local header_end=3
     if [[ -n "$search_query" ]]; then
-        move_to 3 1
+        move_to "$_sep_row" 1
         tui '  %s/%s %s%s%s' "${bblue}${bold}" "${reset}" "${bwhite}${bold}" "$search_query" "${reset}"
-        header_end=4
-        move_to 4 1
+        (( header_end++ ))
+        move_to "$header_end" 1
     else
-        move_to 3 1
+        move_to "$_sep_row" 1
     fi
 
     # Separator
