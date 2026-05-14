@@ -1295,7 +1295,7 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.5.3 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.5.4 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -1319,6 +1319,7 @@ draw() {
     _draw_btn "A"      "open with" "A" "${bg_magenta}" "${white}${bold}"
     _draw_btn "/"      "search"    "/" "${bg_bblue}"   "${white}${bold}"
     _draw_btn "n"      "new"       "n" "${bg_green}"   "${black}${bold}"
+    _draw_btn "N"      "new with"  "N" "${bg_green}"   "${black}${bold}"
     _draw_btn "p"      "all"       "p" "${bg_cyan}"    "${black}${bold}"
     _draw_btn "t"      "sort"      "t" "${bg_yellow}"  "${black}${bold}"
     _draw_btn "c"      "view"      "c" "${bg_yellow}"  "${black}${bold}"
@@ -3872,6 +3873,77 @@ do_settings() {
 }
 
 do_new()   { action="new"; }
+
+do_new_with() {
+    local -a known_agents=(claude claude-yolo claude-edits opencode copilot amp cursor-agent aider gemini codex)
+    local sel=0
+    local count=${#known_agents[@]}
+    for (( i=0; i<count; i++ )); do
+        [[ "${known_agents[$i]}" == "$agent" ]] && sel=$i && break
+    done
+
+    while true; do
+        clear_screen
+        local term_lines term_cols
+        term_lines=$(tput_lines)
+        term_cols=$(tput_cols)
+        local row=2
+        move_to "$row" 1
+        tui '  %sNew project — choose agent:%s' "${bold}${bwhite}" "${reset}"
+        (( row += 2 ))
+
+        for (( i=0; i<count; i++ )); do
+            move_to "$row" 1
+            local a="${known_agents[$i]}"
+            local is_installed=false
+            command -v "$a" &>/dev/null && is_installed=true
+            local tag=""
+            $is_installed || tag="${bred}  not installed${reset}"
+            [[ "$a" == "$agent" ]] && tag+="${dim}  [default]${reset}"
+            local desc
+            desc=$(_agent_desc "$a")
+
+            if (( i == sel )); then
+                tui '  %s> %s%s%s%s' "${bgreen}${bold}" "${bg_sel}${bwhite}${bold}" "$a" "${reset}" "$tag"
+                (( row++ ))
+                move_to "$row" 1
+                tui '      %s%s%s' "${dim}" "$desc" "${reset}"
+                (( row++ ))
+                if ! $is_installed; then
+                    move_to "$row" 1
+                    tui '      %s$ %s%s%s' "${byellow}" "${reset}${yellow}" "$(_agent_install_cmd "$a")" "${reset}"
+                    (( row++ ))
+                fi
+            else
+                if $is_installed; then
+                    tui '    %s%s%s  %s%s%s' "${bwhite}" "$a" "${reset}" "${dim}" "$desc" "${reset}"
+                else
+                    tui '    %s%s%s  %s(not installed)%s' "${dim}" "$a" "${reset}${dim}" "" "${reset}"
+                fi
+                (( row++ ))
+            fi
+        done
+
+        move_to "$term_lines" 1
+        tui '  %sj/k%s navigate  %senter%s create  %sq%s cancel' \
+            "${bwhite}${bold}" "${reset}${dim}" \
+            "${bwhite}${bold}" "${reset}${dim}" \
+            "${bwhite}${bold}" "${reset}"
+
+        local key
+        key=$(read_key)
+        case "$key" in
+            $'\e[A' | k) (( sel > 0 )) && (( sel-- )) ;;
+            $'\e[B' | j) (( sel < count - 1 )) && (( sel++ )) ;;
+            "")
+                open_agent_override="${known_agents[$sel]}"
+                action="new"
+                return
+                ;;
+            q | $'\x1b') return ;;
+        esac
+    done
+}
 do_open()  {
     (( ${#filtered[@]} == 0 )) && return
     local idx="${filtered[$selected]}"
@@ -4488,6 +4560,7 @@ main() {
             /)            do_search ;;
             $'\x1b')      if [[ -n "$search_query" ]]; then do_clear_search; else do_about; fi ;;
             n)            do_new ;;
+            N)            do_new_with ;;
             r)            do_rename ;;
             R)            do_smart_rename ;;
             m)            do_move_dir ;;
@@ -4533,9 +4606,10 @@ main() {
             new)
                 local new_dir="$CLAUDE_BASE/$(date +%Y%m%d_%H%M%S)"
                 mkdir -p "$new_dir"
+                local _new_agent="${open_agent_override:-$agent}"
                 printf '__CLAUDE_CD__:%s\n' "$new_dir" > "$result_file"
-                [[ "$auto_claude" == "on" ]] && printf '__CLAUDE_RUN__\n' >> "$result_file"
-                printf '__AGENT_CMD__:%s\n' "$agent" >> "$result_file"
+                { [[ "$auto_claude" == "on" ]] || [[ -n "$open_agent_override" ]]; } && printf '__CLAUDE_RUN__\n' >> "$result_file"
+                printf '__AGENT_CMD__:%s\n' "$_new_agent" >> "$result_file"
                 printf '__CLAUDE_TITLE__:%s\n' "$(basename "$new_dir")" >> "$result_file"
                 printf '__CLAUDE_TITLE_MODE__:%s\n' "$title_mode" >> "$result_file"
                 ;;
