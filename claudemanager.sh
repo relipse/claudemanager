@@ -7,7 +7,8 @@
 #   claudemanager              — open the TUI
 #   claudemanager --install    — install/update the shell wrapper function
 #   claudemanager --refresh    — re-write the shell wrapper (after an update)
-#   claudemanager <query>      — quick-open a project matching <query>
+#   claudemanager <query>      — quick-open if match score ≥ threshold, else pre-fill search
+#   claudemanager -o <query>   — force-open the best match (no threshold gate)
 
 set -uo pipefail
 
@@ -3199,7 +3200,7 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  2.4.3' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  2.4.4' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     # Show last modified date + relative time of the installed script
@@ -4239,6 +4240,7 @@ _levenshtein() {
 
 _try_quick_open() {
     local query="${1,,}"
+    local force="${2:-0}"
     [[ -z "$query" ]] && return 1
 
     local best_idx=-1 best_score=0
@@ -4258,7 +4260,9 @@ _try_quick_open() {
         fi
     done
 
-    if (( best_score >= 95 && best_idx >= 0 )); then
+    local gate=$match_threshold
+    (( force )) && gate=0
+    if (( best_idx >= 0 && best_score >= gate )); then
         open_dir="${dirs[$best_idx]}"
         _record_open "$open_dir"
         action="open"
@@ -4536,6 +4540,13 @@ main() {
         --refresh) cmd_refresh; return ;;
     esac
 
+    # -o <query>: force-open best match (no threshold gate)
+    local _force_open=0
+    if [[ "${1:-}" == "-o" || "${1:-}" == "--open" ]]; then
+        _force_open=1
+        shift
+    fi
+
     _start_spinner
     load_dirs
     _apply_groups_to_cache
@@ -4544,7 +4555,7 @@ main() {
 
     # Handle CLI argument: quick-open or pre-fill search
     if [[ -n "${1:-}" ]]; then
-        if _try_quick_open "$1"; then
+        if _try_quick_open "$1" "$_force_open"; then
             # Skip TUI — write result and exit
             show_cursor
             local result_file="${CLAUDEMANAGER_RESULT:-}"
