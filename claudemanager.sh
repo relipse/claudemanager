@@ -80,6 +80,9 @@ _mouse_btn_rows=()
 _mouse_btn_starts=()
 _mouse_btn_ends=()
 _mouse_btn_keys=()
+_mouse_list_cols=1
+_mouse_list_max_rows=1
+_mouse_right_col_start=9999
 _btn_col=0
 _btn_row=2
 _btn_max_col=9999
@@ -129,8 +132,7 @@ auto_claude="on"       # on | off
 agent="claude"         # AI agent to launch: claude opencode copilot amp cursor-agent aider gemini codex
 match_threshold=95     # 0-100, minimum similarity % for quick-open
 demo_mode="off"        # off | on — anonymize project names/paths for screenshots
-
-# ── Preferences persistence ──────────────────────────────────────
+hide_empty="on"        # on | off — hide folders with no files
 _load_prefs() {
     [[ -f "$PREFS_FILE" ]] || return 0
     while IFS='=' read -r key val; do
@@ -144,13 +146,14 @@ _load_prefs() {
             agent)            agent="$val" ;;
             match_threshold)  match_threshold="$val" ;;
             demo_mode)        demo_mode="$val" ;;
+            hide_empty)       hide_empty="$val" ;;
         esac
     done < "$PREFS_FILE"
 }
 
 _save_prefs() {
-    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\ndemo_mode=%s\nagent=%s\n' \
-        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" "$demo_mode" "$agent" > "$PREFS_FILE"
+    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\ndemo_mode=%s\nagent=%s\nhide_empty=%s\n' \
+        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" "$demo_mode" "$agent" "$hide_empty" > "$PREFS_FILE"
 }
 
 _load_prefs
@@ -426,6 +429,9 @@ apply_filter() {
     filtered=()
     local i
     for (( i = 0; i < ${#dirs[@]}; i++ )); do
+        if [[ "$hide_empty" == "on" && "${cache_desc[$i]}" == "(empty project)" ]]; then
+            continue
+        fi
         if [[ -z "$search_query" ]]; then
             filtered+=("$i")
         else
@@ -1445,8 +1451,29 @@ draw() {
         local row_height=3
         [[ "$display_mode" == "compact" ]] && row_height=1
         _mouse_row_height="$row_height"
-        local max_items=$(( (effective_lines - list_start - 2) / row_height ))
-        (( max_items < 1 )) && max_items=1
+        local max_rows=$(( (effective_lines - list_start - 2) / row_height ))
+        (( max_rows < 1 )) && max_rows=1
+
+        # Two-column layout for compact mode when terminal is wide enough
+        local use_two_cols=false
+        local col_width=$term_cols
+        local right_col_start=1
+        if [[ "$display_mode" == "compact" && term_cols -ge 120 ]]; then
+            use_two_cols=true
+            col_width=$(( term_cols / 2 - 1 ))
+            right_col_start=$(( col_width + 2 ))
+        fi
+
+        local max_items=$max_rows
+        [[ "$use_two_cols" == "true" ]] && max_items=$(( max_rows * 2 ))
+
+        _mouse_list_cols=1
+        _mouse_list_max_rows=$max_rows
+        _mouse_right_col_start=9999
+        if [[ "$use_two_cols" == "true" ]]; then
+            _mouse_list_cols=2
+            _mouse_right_col_start=$right_col_start
+        fi
 
         if (( selected < scroll_offset )); then
             scroll_offset=$selected
@@ -1479,7 +1506,16 @@ draw() {
             local source="${cache_source[$idx]}"
             local fullpath="${cache_fullpath[$idx]}"
 
-            local row=$(( list_start + i * row_height ))
+            local row col_start
+            if [[ "$use_two_cols" == "true" ]]; then
+                local _col=$(( i / max_rows ))
+                local _row_in_col=$(( i % max_rows ))
+                row=$(( list_start + _row_in_col ))
+                col_start=$(( _col == 0 ? 1 : right_col_start ))
+            else
+                row=$(( list_start + i * row_height ))
+                col_start=1
+            fi
 
             # Source badge for non-local dirs
             local source_badge=""
@@ -1491,13 +1527,20 @@ draw() {
 
             if [[ "$display_mode" == "compact" ]]; then
                 # ── COMPACT MODE: single row per project ──
-                move_to "$row" 1
+                # Truncate title to fit within column
+                local max_title=$(( col_width - 30 ))
+                (( max_title < 8 )) && max_title=8
+                local display_title="$title"
+                if (( ${#display_title} > max_title )); then
+                    display_title="${display_title:0:$(( max_title - 1 ))}…"
+                fi
+                move_to "$row" "$col_start"
                 if (( fidx == selected )); then
                     tui '  %s>%s ' "${bgreen}${bold}" "${reset}"
-                    tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$title" "${reset}"
+                    tui '%s %s %s' "${bg_sel}${bwhite}${bold}" "$display_title" "${reset}"
                 else
                     tui '  %s>%s ' "${dim}" "${reset}"
-                    tui '%s%s%s' "${bold}${bwhite}" "$title" "${reset}"
+                    tui '%s%s%s' "${bold}${bwhite}" "$display_title" "${reset}"
                 fi
                 if [[ -n "$lang_name" ]]; then
                     tui '  %s%s%s' "${lang_color}" "$lang_name" "${reset}"
@@ -1614,13 +1657,21 @@ draw() {
             fi
         done
 
+        if [[ "$use_two_cols" == "true" ]]; then
+            local _srow _sep_col=$(( col_width + 1 ))
+            for ((_srow = list_start; _srow < list_start + max_rows; _srow++)); do
+                move_to "$_srow" "$_sep_col"
+                tui '%s│%s' "${dim}" "${reset}"
+            done
+        fi
+
         # Scroll indicators
         if (( scroll_offset > 0 )); then
             move_to $(( list_start - 1 )) 3
             tui '%s^ more above%s' "${byellow}${bold}" "${reset}"
         fi
         if (( scroll_offset + max_items < ${#filtered[@]} )); then
-            local bottom_row=$(( list_start + max_items * row_height ))
+            local bottom_row=$(( list_start + max_rows * row_height ))
             (( bottom_row > effective_lines - 1 )) && bottom_row=$(( effective_lines - 1 ))
             move_to "$bottom_row" 3
             tui '%sv more below%s' "${byellow}${bold}" "${reset}"
@@ -3148,7 +3199,7 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  2.4.2' "${bold}${bwhite}" "${reset}"
+    tui '  %sVersion:%s  2.4.3' "${bold}${bwhite}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1
     # Show last modified date + relative time of the installed script
@@ -3563,11 +3614,16 @@ _draw_settings() {
             "date = encoded  |  modified = most recent file  |  recent = last opened  |  name  |  language"
         (( row += (sel == 2 ? 3 : 2) ))
 
-        # 3: Demo Mode
+        # 3: Hide Empty
+        _draw_setting_row "$row" "$(( sel == 3 ))" "Hide Empty" "$hide_empty" \
+            "Hide folders with no files (e.g. blank timestamp sessions)"
+        (( row += (sel == 3 ? 3 : 2) ))
+
+        # 4: Demo Mode
         local demo_desc="Anonymize all project names, paths & groups for screenshots"
         local demo_val_color=""
         [[ "$demo_mode" == "on" ]] && demo_val_color="${bg_magenta}${bwhite}${bold}"
-        _draw_setting_row "$row" "$(( sel == 3 ))" "Demo Mode" "$demo_mode" \
+        _draw_setting_row "$row" "$(( sel == 4 ))" "Demo Mode" "$demo_mode" \
             "$demo_desc" "$demo_val_color"
 
     else
@@ -3612,7 +3668,7 @@ _draw_settings() {
         local _agent_display="$agent"
         command -v "$agent" &>/dev/null || _agent_display="${agent} ${bred}(not found)${reset}"
         _draw_setting_row "$row" "$(( sel == 1 ))" "AI Agent" "$_agent_display" \
-            "claude  opencode  copilot  amp  cursor-agent  aider  gemini  codex"
+            "claude  claude-yolo  claude-edits  opencode  copilot  amp  cursor-agent  aider  gemini  codex"
         (( row += (sel == 1 ? 3 : 2) ))
 
         # 2: Auto-launch Agent
@@ -3723,13 +3779,14 @@ _settings_has_changes() {
     [[ "$auto_claude" != "$_orig_auto_claude" ]] || \
     [[ "$agent" != "$_orig_agent" ]] || \
     [[ "$demo_mode" != "$_orig_demo_mode" ]] || \
+    [[ "$hide_empty" != "$_orig_hide_empty" ]] || \
     [[ "$match_threshold" != "$_orig_match_threshold" ]]
 }
 
 do_settings() {
     local settings_sel=0
     local settings_page=1
-    local page1_count=4   # View Mode, Display Mode, Sort Mode, Demo Mode
+    local page1_count=5   # View Mode, Display Mode, Sort Mode, Hide Empty, Demo Mode
     local page2_count=5   # Title Persistence, AI Agent, Auto-launch Agent, Match Threshold, Claude Helpers
     _settings_status=""
     _settings_status_color=""
@@ -3742,6 +3799,7 @@ do_settings() {
     local _orig_auto_claude="$auto_claude"
     local _orig_agent="$agent"
     local _orig_demo_mode="$demo_mode"
+    local _orig_hide_empty="$hide_empty"
     local _orig_match_threshold="$match_threshold"
 
     while true; do
@@ -3771,7 +3829,8 @@ do_settings() {
                         0) view_mode=$(_cycle_value "$view_mode" 1 local all) ;;
                         1) display_mode=$(_cycle_value "$display_mode" 1 compact full grid) ;;
                         2) sort_mode=$(_cycle_value "$sort_mode" 1 date modified recent name language) ;;
-                        3) demo_mode=$(_cycle_value "$demo_mode" 1 off on) ;;
+                        3) hide_empty=$(_cycle_value "$hide_empty" 1 on off) ;;
+                        4) demo_mode=$(_cycle_value "$demo_mode" 1 off on) ;;
                     esac
                 else
                     case "$settings_sel" in
@@ -3781,7 +3840,7 @@ do_settings() {
                                 case "$title_mode" in tmux_split|tmux_status) _install_tmux ;; esac
                             fi
                             ;;
-                        1) agent=$(_cycle_value "$agent" 1 claude opencode copilot amp cursor-agent aider gemini codex) ;;
+                        1) agent=$(_cycle_value "$agent" 1 claude claude-yolo claude-edits opencode copilot amp cursor-agent aider gemini codex) ;;
                         2) auto_claude=$(_cycle_value "$auto_claude" 1 on off) ;;
                         3) (( match_threshold < 100 )) && (( match_threshold += 5 )) ;;
                     esac
@@ -3794,7 +3853,8 @@ do_settings() {
                         0) view_mode=$(_cycle_value "$view_mode" -1 local all) ;;
                         1) display_mode=$(_cycle_value "$display_mode" -1 compact full grid) ;;
                         2) sort_mode=$(_cycle_value "$sort_mode" -1 date modified recent name language) ;;
-                        3) demo_mode=$(_cycle_value "$demo_mode" -1 off on) ;;
+                        3) hide_empty=$(_cycle_value "$hide_empty" -1 on off) ;;
+                        4) demo_mode=$(_cycle_value "$demo_mode" -1 off on) ;;
                     esac
                 else
                     case "$settings_sel" in
@@ -3804,7 +3864,7 @@ do_settings() {
                                 case "$title_mode" in tmux_split|tmux_status) _install_tmux ;; esac
                             fi
                             ;;
-                        1) agent=$(_cycle_value "$agent" -1 claude opencode copilot amp cursor-agent aider gemini codex) ;;
+                        1) agent=$(_cycle_value "$agent" -1 claude claude-yolo claude-edits opencode copilot amp cursor-agent aider gemini codex) ;;
                         2) auto_claude=$(_cycle_value "$auto_claude" -1 on off) ;;
                         3) (( match_threshold > 0 )) && (( match_threshold -= 5 )) ;;
                     esac
@@ -3855,6 +3915,7 @@ do_settings() {
                         auto_claude="$_orig_auto_claude"
                         agent="$_orig_agent"
                         demo_mode="$_orig_demo_mode"
+                        hide_empty="$_orig_hide_empty"
                         match_threshold="$_orig_match_threshold"
                         status_msg="Settings discarded"
                         status_color="${byellow}${bold}"
@@ -4551,25 +4612,29 @@ main() {
                         else
                             # Map click to item index
                             local _cidx=-1
-                        if [[ "$_mouse_display_mode" == "grid" ]]; then
-                            local _gr=$(( (_row - _mouse_list_start) / _mouse_cell_height ))
-                            local _gc=$(( (_col - 2) / _mouse_cell_width ))
-                            (( _gr >= 0 && _gc >= 0 && _gc < _mouse_grid_cols )) && _cidx=$(( scroll_offset + _gr * _mouse_grid_cols + _gc ))
-                        else
-                            local _lr=$(( (_row - _mouse_list_start) / _mouse_row_height ))
-                            (( _lr >= 0 )) && _cidx=$(( scroll_offset + _lr ))
-                        fi
-                        if (( _cidx >= 0 && _cidx < ${#filtered[@]} )); then
-                            if (( _cidx == selected )); then
-                                # Click on already-selected item → treat as Enter
-                                key=""
+                            if [[ "$_mouse_display_mode" == "grid" ]]; then
+                                local _gr=$(( (_row - _mouse_list_start) / _mouse_cell_height ))
+                                local _gc=$(( (_col - 2) / _mouse_cell_width ))
+                                (( _gr >= 0 && _gc >= 0 && _gc < _mouse_grid_cols )) && _cidx=$(( scroll_offset + _gr * _mouse_grid_cols + _gc ))
                             else
-                                selected="$_cidx"
+                                local _lr=$(( (_row - _mouse_list_start) / _mouse_row_height ))
+                                local _lc=0
+                                (( _mouse_list_cols == 2 && _col >= _mouse_right_col_start )) && _lc=1
+                                if (( _lr >= 0 && _lr < _mouse_list_max_rows )); then
+                                    _cidx=$(( scroll_offset + _lr + _lc * _mouse_list_max_rows ))
+                                fi
+                            fi
+                            if (( _cidx >= 0 && _cidx < ${#filtered[@]} )); then
+                                if (( _cidx == selected )); then
+                                    # Click on already-selected item → treat as Enter
+                                    key=""
+                                else
+                                    selected="$_cidx"
+                                    continue
+                                fi
+                            else
                                 continue
                             fi
-                        else
-                            continue
-                        fi
                         fi
                     else
                         continue
@@ -4606,11 +4671,19 @@ main() {
             $'\e[D' | h)
                 if [[ "$display_mode" == "grid" ]]; then
                     (( selected > 0 )) && (( selected-- ))
+                elif [[ "$display_mode" == "compact" && _mouse_list_cols == 2 ]]; then
+                    local _pos=$(( selected - scroll_offset ))
+                    local _lc=$(( _pos / _mouse_list_max_rows ))
+                    (( _lc > 0 )) && (( selected -= _mouse_list_max_rows ))
                 fi
                 ;;
             $'\e[C' | l)
                 if [[ "$display_mode" == "grid" ]]; then
                     (( selected < ${#filtered[@]} - 1 )) && (( selected++ )) || true
+                elif [[ "$display_mode" == "compact" && _mouse_list_cols == 2 ]]; then
+                    local _pos=$(( selected - scroll_offset ))
+                    local _lc=$(( _pos / _mouse_list_max_rows ))
+                    (( _lc == 0 && selected + _mouse_list_max_rows < ${#filtered[@]} )) && (( selected += _mouse_list_max_rows ))
                 fi
                 ;;
             $'\e[5~')     (( selected -= 5 )); (( selected < 0 )) && selected=0 ;;
