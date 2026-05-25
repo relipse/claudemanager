@@ -17,7 +17,7 @@ CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
 EXTRA_DIRS_FILE="$CLAUDE_BASE/.claudemanager_dirs"
 IGNORE_FILE="$CLAUDE_BASE/.claudemanager_ignore"
 CACHE_FILE="$CLAUDE_BASE/.claudemanager_cache"
-CACHE_SCHEMA="7"  # bump when _compute_title/_compute_* output format changes
+CACHE_SCHEMA="8"  # bump when _compute_title/_compute_* output format changes
 BUILD_DATE=$(stat -f '%Sm' -t '%Y-%m-%d' "${BASH_SOURCE[0]}" 2>/dev/null || date '+%Y-%m-%d')
 DIRLIST_CACHE="$CLAUDE_BASE/.claudemanager_dirlist"
 PREFS_FILE="$CLAUDE_BASE/.claudemanager_prefs"
@@ -125,6 +125,7 @@ open_force_run=false
 status_msg=""
 status_color="$green"
 search_query=""
+declare -a browse_stack=()   # paths drilled into via subfolder browse; empty = top-level project list
 sort_mode="date"       # date | modified | recent | name | language
 view_mode="local"      # local | all
 display_mode="compact"  # compact | full | grid
@@ -448,6 +449,89 @@ apply_filter() {
 
 # ── Compute helpers (called once per dir at load time) ────────────
 
+# Peek inside a directory to derive a human project name. Used when the
+# directory itself carries no name (e.g. a bare timestamp like 20260524_152705)
+# so the list shows "Stick Animal Fighters" instead of "May 24 15:27".
+# Prints the name and returns 0 on success; returns 1 if nothing usable found.
+_inspect_title() {
+    local dir="$1"
+    local n=""
+
+    # 1. README heading — the human-curated title, if it looks like a name
+    local readme
+    for readme in "$dir/README.md" "$dir/readme.md" "$dir/Readme.md" "$dir/README"; do
+        [[ -f "$readme" ]] || continue
+        n=$(grep -m1 -E '^#{1,2}[[:space:]]+[^[:space:]]' "$readme" 2>/dev/null \
+            | sed -E 's/^#{1,2}[[:space:]]+//; s/[[:space:]]+$//; s/[*_`]//g')
+        if [[ -n "$n" && ${#n} -le 40 && "${n,,}" != "readme" && "${n,,}" != "project" ]]; then
+            printf '%s' "$n"; return 0
+        fi
+        break
+    done
+
+    # 2. Godot — application config name
+    if [[ -f "$dir/project.godot" ]]; then
+        n=$(grep -m1 -E '^config/name=' "$dir/project.godot" 2>/dev/null \
+            | sed -E 's/^config\/name="?([^"]*)"?.*/\1/')
+        [[ -n "$n" ]] && { printf '%s' "$n"; return 0; }
+    fi
+
+    # 3. Xcode project / workspace name
+    local xc
+    for xc in "$dir"/*.xcodeproj "$dir"/*.xcworkspace; do
+        [[ -e "$xc" ]] || continue
+        n="$(basename "$xc")"; n="${n%.*}"
+        [[ -n "$n" ]] && { printf '%s' "$n"; return 0; }
+    done
+
+    # 4. Node package name
+    if [[ -f "$dir/package.json" ]]; then
+        n=$(grep -m1 -E '"name"[[:space:]]*:' "$dir/package.json" 2>/dev/null \
+            | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
+        [[ -n "$n" && "$n" == "${n//\"/}" ]] && { printf '%s' "$n"; return 0; }
+    fi
+
+    # 5. Rust crate name
+    if [[ -f "$dir/Cargo.toml" ]]; then
+        n=$(grep -m1 -E '^[[:space:]]*name[[:space:]]*=' "$dir/Cargo.toml" 2>/dev/null \
+            | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+        [[ -n "$n" ]] && { printf '%s' "$n"; return 0; }
+    fi
+
+    # 6. Python project name
+    if [[ -f "$dir/pyproject.toml" ]]; then
+        n=$(grep -m1 -E '^[[:space:]]*name[[:space:]]*=' "$dir/pyproject.toml" 2>/dev/null \
+            | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+        [[ -n "$n" ]] && { printf '%s' "$n"; return 0; }
+    fi
+
+    # 7. Swift package name
+    if [[ -f "$dir/Package.swift" ]]; then
+        n=$(grep -m1 -E '[[:space:]]name:[[:space:]]*"' "$dir/Package.swift" 2>/dev/null \
+            | sed -E 's/.*name:[[:space:]]*"([^"]*)".*/\1/')
+        [[ -n "$n" ]] && { printf '%s' "$n"; return 0; }
+    fi
+
+    # 8. Go module — last path segment
+    if [[ -f "$dir/go.mod" ]]; then
+        n=$(grep -m1 -E '^module[[:space:]]+' "$dir/go.mod" 2>/dev/null \
+            | sed -E 's/^module[[:space:]]+//; s/[[:space:]]+$//; s#.*/##')
+        [[ -n "$n" ]] && { printf '%s' "$n"; return 0; }
+    fi
+
+    # 9. Git remote repository name
+    if [[ -d "$dir/.git" ]]; then
+        local url
+        url=$(git -C "$dir" remote get-url origin 2>/dev/null)
+        if [[ -n "$url" ]]; then
+            n="${url##*/}"; n="${n%.git}"
+            [[ -n "$n" ]] && { printf '%s' "$n"; return 0; }
+        fi
+    fi
+
+    return 1
+}
+
 # Auto-detect the "app title" - the main project name
 _compute_title() {
     local dir="$1"
@@ -498,8 +582,17 @@ _compute_title() {
             return
         fi
     fi
-    # 2c. Timestamped scratch dir with no clear subdir name → pretty date "Mon DD HH:MM"
+    # 2c. Timestamped scratch dir with no clear subdir name. Before giving up
+    #     and showing a bare date, inspect the folder contents for a real
+    #     project identity (README title, project.godot, manifests, git remote).
     if [[ "$_ct_base" =~ ^([0-9]{4})([0-9]{2})([0-9]{2})[_-]([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+        local _ct_inspected
+        _ct_inspected=$(_inspect_title "$dir")
+        if [[ -n "$_ct_inspected" ]]; then
+            printf '%s' "$_ct_inspected"
+            return
+        fi
+        # Nothing identifiable inside → pretty date "Mon DD HH:MM"
         local _ct_pretty
         _ct_pretty=$(date -j -f '%Y%m%d%H%M%S' \
             "${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}" \
@@ -1302,12 +1395,16 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.5.5 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv2.6.0 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
     fi
-    tui '  %s%s projects%s' "${dim}" "$count_label" "${reset}"
+    if (( ${#browse_stack[@]} > 0 )); then
+        tui '  %s%s subfolders%s' "${dim}" "$count_label" "${reset}"
+    else
+        tui '  %s%s projects%s' "${dim}" "$count_label" "${reset}"
+    fi
 
     # View + sort indicators
     local view_label="local"
@@ -1323,6 +1420,10 @@ draw() {
     _btn_col=2
     _btn_max_col=$(( term_cols - 1 ))
     _draw_btn "enter"  "open"      ""  "${bg_gray}"    "${bwhite}${bold}"
+    _draw_btn ">"      "into"      ">" "${bg_cyan}"    "${black}${bold}"
+    if (( ${#browse_stack[@]} > 0 )); then
+        _draw_btn "<"  "up"        "<" "${bg_cyan}"    "${black}${bold}"
+    fi
     _draw_btn "A"      "open with" "A" "${bg_magenta}" "${white}${bold}"
     _draw_btn "/"      "search"    "/" "${bg_bblue}"   "${white}${bold}"
     _draw_btn "n"      "new"       "n" "${bg_green}"   "${black}${bold}"
@@ -1345,14 +1446,22 @@ draw() {
     local _sep_row=$(( _btn_row + 1 ))
     local header_end="$_sep_row"
 
+    # Browse breadcrumb (if drilled into subfolders)
+    if (( ${#browse_stack[@]} > 0 )); then
+        move_to "$_sep_row" 1
+        tui '  %sin %s%s  %s(< or esc to go up)%s' "${bcyan}${bold}" "${browse_stack[-1]}" "${reset}" "${dim}${italic}" "${reset}"
+        (( header_end++ ))
+        move_to "$header_end" 1
+    fi
+
     # Search bar (if active)
     if [[ -n "$search_query" ]]; then
-        move_to "$_sep_row" 1
+        move_to "$header_end" 1
         tui '  %s/%s %s%s%s' "${bblue}${bold}" "${reset}" "${bwhite}${bold}" "$search_query" "${reset}"
         (( header_end++ ))
         move_to "$header_end" 1
     else
-        move_to "$_sep_row" 1
+        move_to "$header_end" 1
     fi
 
     # Separator
@@ -2097,6 +2206,17 @@ do_delete() {
 }
 
 do_refresh() {
+    if (( ${#browse_stack[@]} > 0 )); then
+        _load_subdirs "${browse_stack[-1]}"
+        _apply_groups_to_cache
+        _apply_demo_mode
+        apply_filter
+        selected=0
+        scroll_offset=0
+        status_msg="Refreshed ${browse_stack[-1]}"
+        status_color="${bgreen}${bold}"
+        return
+    fi
     load_dirs "true"
     _apply_groups_to_cache
     _apply_demo_mode
@@ -2104,6 +2224,79 @@ do_refresh() {
     scroll_offset=0
     status_msg="Refreshed all projects"
     status_color="${bgreen}${bold}"
+}
+
+# Replace the project list with the immediate subdirectories of $1.
+_load_subdirs() {
+    local parent="$1"
+    dirs=(); cache_title=(); cache_base=(); cache_date=(); cache_reldate=()
+    cache_desc=(); cache_files=(); cache_lang=(); cache_langcolor=()
+    cache_framework=(); cache_source=(); cache_fullpath=(); cache_mtime=()
+    cache_epoch=(); cache_recent=()
+    local now_epoch d base mtime
+    now_epoch=$(date +%s)
+    for d in "$parent"/*/; do
+        [[ -d "$d" ]] || continue
+        d="${d%/}"
+        base="${d##*/}"
+        [[ "$base" == .* ]] && continue
+        mtime=$(stat -f '%m' "$d" 2>/dev/null || echo "0")
+        _cache_one_dir "$d" "browsed" "false" "$mtime" "$now_epoch"
+    done
+}
+
+# Drill into the selected directory, showing its subfolders as the new list.
+do_drill_in() {
+    (( ${#filtered[@]} == 0 )) && return
+    local idx="${filtered[$selected]}"
+    local target="${dirs[$idx]}"
+    [[ -d "$target" ]] || return
+    # Count drillable subfolders first so we can warn instead of emptying the view
+    local has_sub=false d base
+    for d in "$target"/*/; do
+        [[ -d "$d" ]] || continue
+        base="$(basename "$d")"
+        [[ "$base" == .* ]] && continue
+        has_sub=true; break
+    done
+    if ! $has_sub; then
+        status_msg="No subfolders in ${target##*/}"
+        status_color="${byellow}${bold}"
+        return
+    fi
+    browse_stack+=("$target")
+    [[ -n "$search_query" ]] && do_clear_search
+    _load_subdirs "$target"
+    _apply_groups_to_cache
+    _apply_demo_mode
+    apply_filter
+    selected=0
+    scroll_offset=0
+    status_msg="Browsing ${target}"
+    status_color="${bcyan}${bold}"
+}
+
+# Go back up one level; from the top of the browse stack, return to the project list.
+do_drill_out() {
+    (( ${#browse_stack[@]} == 0 )) && return
+    unset 'browse_stack[-1]'
+    [[ -n "$search_query" ]] && do_clear_search
+    if (( ${#browse_stack[@]} > 0 )); then
+        _load_subdirs "${browse_stack[-1]}"
+        _apply_groups_to_cache
+        _apply_demo_mode
+        apply_filter
+        status_msg="Browsing ${browse_stack[-1]}"
+        status_color="${bcyan}${bold}"
+    else
+        load_dirs
+        _apply_groups_to_cache
+        _apply_demo_mode
+        status_msg="Back to projects"
+        status_color="${bcyan}${bold}"
+    fi
+    selected=0
+    scroll_offset=0
 }
 
 do_toggle_view() {
@@ -3519,16 +3712,76 @@ END_HELP
 
     chmod +x "$bin_dir"/claude-{yolo,edits,pin,help}
 
-    # Ensure ~/bin is on PATH hint
-    local path_ok=false
-    [[ ":$PATH:" == *":$bin_dir:"* ]] && path_ok=true
+    _ensure_bin_on_path "$bin_dir"
+    _test_claude_helpers "$bin_dir"
 
-    _settings_status="Claude helpers installed to $bin_dir"
-    _settings_status_color="${bgreen}${bold}"
-    if ! $path_ok; then
-        _settings_status+="  (add $bin_dir to PATH)"
+    local persisted_msg=""
+    if (( ${#_path_persist_updated[@]} > 0 )); then
+        persisted_msg="  PATH updated in: ${_path_persist_updated[*]}"
+    fi
+
+    if (( ${#_test_helpers_fail[@]} == 0 )); then
+        _settings_status="Claude helpers installed and verified in $bin_dir.${persisted_msg}"
+        _settings_status_color="${bgreen}${bold}"
+    else
+        _settings_status="Installed to $bin_dir but tests failed: ${_test_helpers_fail[*]}.${persisted_msg}"
         _settings_status_color="${byellow}${bold}"
     fi
+}
+
+# Persist ~/bin on PATH (marker-guarded) and export in current process.
+# Populates _path_persist_updated with rc-file basenames that were edited.
+_ensure_bin_on_path() {
+    local bin_dir="$1"
+
+    case ":$PATH:" in
+        *":$bin_dir:"*) ;;
+        *) export PATH="$bin_dir:$PATH" ;;
+    esac
+
+    local marker="# claudemanager: prepend ~/bin to PATH"
+    local block
+    block=$(cat <<EOF
+$marker
+case ":\$PATH:" in
+    *":$bin_dir:"*) ;;
+    *) export PATH="$bin_dir:\$PATH" ;;
+esac
+EOF
+)
+
+    _path_persist_updated=()
+    local rc
+    for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+        [[ -e "$rc" ]] || continue
+        if ! grep -qF "$marker" "$rc" 2>/dev/null; then
+            printf '\n%s\n' "$block" >> "$rc"
+            _path_persist_updated+=("$(basename "$rc")")
+        fi
+    done
+}
+
+# Validate each helper: executable bit, syntax, PATH resolution.
+# Populates _test_helpers_fail with "name:reason" entries (empty on success).
+_test_claude_helpers() {
+    local bin_dir="$1"
+    _test_helpers_fail=()
+    local h p
+    for h in $(_helpers_list); do
+        p="$bin_dir/$h"
+        if [[ ! -x "$p" ]]; then
+            _test_helpers_fail+=("$h:not-executable")
+            continue
+        fi
+        if ! bash -n "$p" 2>/dev/null; then
+            _test_helpers_fail+=("$h:syntax-error")
+            continue
+        fi
+        if ! command -v "$h" >/dev/null 2>&1; then
+            _test_helpers_fail+=("$h:not-on-PATH")
+            continue
+        fi
+    done
 }
 
 _uninstall_claude_helpers() {
@@ -4357,6 +4610,38 @@ _install_write_wrapper() {
 _cm_launch_claude() {
     local title="\$1" mode="\$2" agent_cmd="\${3:-claude}"
 
+    # Ensure ~/bin (where claudemanager installs helpers) is on PATH for this shell
+    if [[ -d "\$HOME/bin" ]]; then
+        case ":\$PATH:" in
+            *":\$HOME/bin:"*) ;;
+            *) export PATH="\$HOME/bin:\$PATH" ;;
+        esac
+    fi
+
+    # Guard: verify agent is installed before any terminal manipulation
+    if ! command -v "\$agent_cmd" &>/dev/null; then
+        printf '\\n\\e[31m[error]\\e[0m  Agent not found: %s\\n' "\$agent_cmd"
+        local _hint
+        case "\$agent_cmd" in
+            claude)       _hint="npm install -g @anthropic-ai/claude-code" ;;
+            claude-yolo|claude-edits|claude-pin|claude-help)
+                          _hint="press , then i in claudemanager (Settings -> Claude Helpers)" ;;
+            opencode)     _hint="curl -fsSL https://opencode.ai/install | sh" ;;
+            copilot)      _hint="gh extension install github/gh-copilot" ;;
+            amp)          _hint="curl -fsSL https://ampcode.com/install | sh" ;;
+            cursor-agent) _hint="Install Cursor IDE from cursor.com" ;;
+            aider)        _hint="pipx install aider-chat" ;;
+            gemini)       _hint="npm install -g @google/gemini-cli" ;;
+            codex)        _hint="npm install -g @openai/codex" ;;
+            *)            _hint="see the project documentation" ;;
+        esac
+        printf '       Install:  %s\\n\\n' "\$_hint"
+        printf 'Press any key to continue... '
+        IFS= read -rsn1
+        printf '\\n'
+        return 1
+    fi
+
     # Always set the terminal window/tab title (non-intrusive, works everywhere)
     if [[ -n "\$title" ]]; then
         printf '\\e]0;claudemanager: %s\\a' "\$title"
@@ -4686,6 +4971,8 @@ main() {
                     local _pos=$(( selected - scroll_offset ))
                     local _lc=$(( _pos / _mouse_list_max_rows ))
                     (( _lc > 0 )) && (( selected -= _mouse_list_max_rows ))
+                else
+                    do_drill_out
                 fi
                 ;;
             $'\e[C' | l)
@@ -4695,13 +4982,17 @@ main() {
                     local _pos=$(( selected - scroll_offset ))
                     local _lc=$(( _pos / _mouse_list_max_rows ))
                     (( _lc == 0 && selected + _mouse_list_max_rows < ${#filtered[@]} )) && (( selected += _mouse_list_max_rows ))
+                else
+                    do_drill_in
                 fi
                 ;;
             $'\e[5~')     (( selected -= 5 )); (( selected < 0 )) && selected=0 ;;
             $'\e[6~')     (( selected += 5 )); (( selected >= ${#filtered[@]} )) && selected=$(( ${#filtered[@]} - 1 )); (( selected < 0 )) && selected=0 ;;
             "")           do_open ;;
+            ">")          do_drill_in ;;
+            "<")          do_drill_out ;;
             /)            do_search ;;
-            $'\x1b')      if [[ -n "$search_query" ]]; then do_clear_search; else do_about; fi ;;
+            $'\x1b')      if [[ -n "$search_query" ]]; then do_clear_search; elif (( ${#browse_stack[@]} > 0 )); then do_drill_out; else do_about; fi ;;
             n)            do_new ;;
             N)            do_new_with ;;
             r)            do_rename ;;
