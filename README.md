@@ -110,7 +110,17 @@ claudemanager myproject
 | Key | Action |
 |-----|--------|
 | `,` | Settings |
+| `u` | Check for updates / view what's new / install |
 | `?` | About / help |
+
+## Updates
+
+claudemanager can keep itself current from the public GitHub repo:
+
+- Press `u` anytime to check GitHub, see a **What's new** list of changes since your installed version, and install with one confirmation.
+- **Settings → page 2**:
+  - **Auto-update Check** — how often to check GitHub in the background (off / daily / every 3, 7, 14, 30 days).
+  - **Auto-install Updates** — when `on`, a found update is shown (with its changelog) and installed automatically at startup; when `off`, you're just notified and can press `u`.
 
 ## Stats Pages
 

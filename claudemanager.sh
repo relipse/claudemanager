@@ -26,12 +26,15 @@ GROUPS_FILE="$CLAUDE_BASE/.claudemanager_groups"
 GH_ASSIGN_FILE="$CLAUDE_BASE/.claudemanager_gh"   # repo "owner/name<TAB>local-path" assignments
 
 # ── Version & auto-update ─────────────────────────────────────────
-CM_VERSION="2.8.0"                          # single source of truth for the version
+CM_VERSION="2.9.0"                          # single source of truth for the version
 UPDATE_STATE_FILE="$CLAUDE_BASE/.claudemanager_update"   # last check epoch + latest known remote version
 CM_REPO_RAW="https://raw.githubusercontent.com/relipse/claudemanager/main"
+CM_REPO_API="https://api.github.com/repos/relipse/claudemanager"  # for the changelog
 UPDATE_VERSION_URL="$CM_REPO_RAW/VERSION"   # tiny file holding just the latest version string
 UPDATE_INSTALL_URL="$CM_REPO_RAW/install.sh"
 update_available=""                         # set to the remote version when a newer release is found
+_changelog_cache=""                         # memoized changelog (entries newer than CM_VERSION)
+_changelog_fetched=0
 
 # ── Colors ────────────────────────────────────────────────────────
 reset=$'\e[0m'
@@ -146,6 +149,7 @@ match_threshold=95     # 0-100, minimum similarity % for quick-open
 demo_mode="off"        # off | on — anonymize project names/paths for screenshots
 hide_empty="on"        # on | off — hide folders with no files
 auto_update_days=0     # 0 = off; otherwise check GitHub for a newer version every N days
+auto_update="off"      # on | off — when a newer version is found, install it automatically at startup
 gh_clone_dir="$HOME/github"  # default destination for `gh repo clone` (remembers last choice)
 _load_prefs() {
     [[ -f "$PREFS_FILE" ]] || return 0
@@ -162,14 +166,15 @@ _load_prefs() {
             demo_mode)        demo_mode="$val" ;;
             hide_empty)       hide_empty="$val" ;;
             auto_update_days) auto_update_days="$val" ;;
+            auto_update)      auto_update="$val" ;;
             gh_clone_dir)     gh_clone_dir="$val" ;;
         esac
     done < "$PREFS_FILE"
 }
 
 _save_prefs() {
-    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\ndemo_mode=%s\nagent=%s\nhide_empty=%s\nauto_update_days=%s\ngh_clone_dir=%s\n' \
-        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" "$demo_mode" "$agent" "$hide_empty" "$auto_update_days" "$gh_clone_dir" > "$PREFS_FILE"
+    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\ndemo_mode=%s\nagent=%s\nhide_empty=%s\nauto_update_days=%s\nauto_update=%s\ngh_clone_dir=%s\n' \
+        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" "$demo_mode" "$agent" "$hide_empty" "$auto_update_days" "$auto_update" "$gh_clone_dir" > "$PREFS_FILE"
 }
 
 _load_prefs
@@ -241,6 +246,44 @@ _maybe_check_update() {
     (( now - last < auto_update_days * 86400 )) && return 0
     ( _run_update_check ) >/dev/null 2>&1 &
     disown 2>/dev/null || true
+}
+
+# ── Changelog: show what changed, pulled from the public GitHub repo ──────
+# Print release notes (commit subjects shaped "vX.Y.Z: …") newest-first.
+# With $1 set, restrict to versions strictly newer than it. Empty on failure.
+_fetch_changelog() {
+    command -v curl >/dev/null 2>&1 || return 1
+    local since="${1:-}" raw line ver
+    raw=$(curl -fsSL --max-time 8 "$CM_REPO_API/commits?per_page=60" 2>/dev/null) || return 1
+    [[ -n "$raw" ]] || return 1
+    # GitHub returns JSON; each commit's subject is the first line of "message".
+    while IFS= read -r line; do
+        [[ "$line" == v*:* ]] || continue
+        ver="${line#v}"; ver="${ver%%:*}"
+        [[ "$ver" =~ ^[0-9.]+$ ]] || continue
+        [[ -n "$since" ]] && { _version_gt "$ver" "$since" || continue; }
+        printf '%s\n' "$line"
+    done < <(printf '%s\n' "$raw" \
+        | grep -oE '"message"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+:[^"\\]*' \
+        | sed -E 's/^"message"[[:space:]]*:[[:space:]]*"//')
+}
+
+# Memoized list of changes newer than the installed version (newest first).
+_changelog_since_current() {
+    if (( ! _changelog_fetched )); then
+        _changelog_cache="$(_fetch_changelog "$CM_VERSION")"
+        _changelog_fetched=1
+    fi
+    [[ -n "$_changelog_cache" ]] && printf '%s\n' "$_changelog_cache"
+}
+
+# At startup: if auto-install is on and a newer version is already known,
+# show what changed and update in place (no prompt). Does not return if it runs.
+_maybe_auto_update() {
+    [[ "${auto_update:-off}" == "on" ]] || return 0
+    [[ -n "$update_available" ]] || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    _do_self_update auto
 }
 
 # ── Demo mode: anonymize sensitive data for screenshots ──────────
@@ -4445,6 +4488,13 @@ _draw_settings() {
         fi
         _draw_setting_row "$row" "$(( sel == 5 ))" "Auto-update Check" "$au_display" \
             "Check GitHub for a newer version on this schedule (off = never check)" "$au_color"
+        (( row += (sel == 5 ? 3 : 2) ))
+
+        # 6: Auto-install Updates
+        local ai_color=""
+        [[ "$auto_update" == "on" ]] && ai_color="${bgreen}${bold}"
+        _draw_setting_row "$row" "$(( sel == 6 ))" "Auto-install Updates" "$auto_update" \
+            "on = show changes & install a found update at startup  |  off = just notify (press u)" "$ai_color"
     fi
 
     # Status message
@@ -4494,6 +4544,8 @@ _export_prefs() {
         printf 'title_mode=%s\n' "$title_mode"
         printf 'auto_claude=%s\n' "$auto_claude"
         printf 'agent=%s\n' "$agent"
+        printf 'auto_update_days=%s\n' "$auto_update_days"
+        printf 'auto_update=%s\n' "$auto_update"
     } > "$export_path"
     _settings_status="Exported to $export_path"
     _settings_status_color="${bgreen}${bold}"
@@ -4518,6 +4570,8 @@ _import_prefs() {
             title_mode)   title_mode="$val" ;;
             auto_claude)  auto_claude="$val" ;;
             agent)        agent="$val" ;;
+            auto_update_days) auto_update_days="$val" ;;
+            auto_update)  auto_update="$val" ;;
         esac
     done < "$import_path"
     _settings_status="Imported from $import_path"
@@ -4533,17 +4587,32 @@ _settings_has_changes() {
     [[ "$agent" != "$_orig_agent" ]] || \
     [[ "$demo_mode" != "$_orig_demo_mode" ]] || \
     [[ "$hide_empty" != "$_orig_hide_empty" ]] || \
-    [[ "$match_threshold" != "$_orig_match_threshold" ]]
+    [[ "$match_threshold" != "$_orig_match_threshold" ]] || \
+    [[ "$auto_update_days" != "$_orig_auto_update_days" ]] || \
+    [[ "$auto_update" != "$_orig_auto_update" ]]
 }
 
 # Pull the latest release and re-run the installer, then quit so the user
 # restarts on the new version. Tears down the TUI first; writes to /dev/tty
 # because stdout is reserved for wrapper control signals.
 _do_self_update() {
+    local _mode="${1:-}"   # auto = invoked by auto-update; quiet = changelog already shown
     disable_mouse 2>/dev/null || true
     show_cursor
     clear_screen
     {
+        printf '\n  \e[1;36mclaudemanager\e[0m  v%s  →  \e[1;32mv%s\e[0m\n' "$CM_VERSION" "${update_available:-latest}"
+        if [[ "$_mode" != "quiet" ]]; then
+            local _cl _line
+            _cl=$(_changelog_since_current)
+            if [[ -n "$_cl" ]]; then
+                printf "\n  \e[1mWhat's new:\e[0m\n"
+                while IFS= read -r _line; do
+                    printf '    \e[32m•\e[0m %s\n' "$_line"
+                done <<< "$_cl"
+            fi
+        fi
+        [[ "$_mode" == "auto" ]] && printf '\n  \e[2mAuto-update is on — installing the new version…\e[0m\n'
         printf '\n  Updating claudemanager to v%s ...\n\n' "${update_available:-latest}"
         if curl -fsSL "$UPDATE_INSTALL_URL" | bash; then
             rm -f "$UPDATE_STATE_FILE" 2>/dev/null || true
@@ -4558,9 +4627,40 @@ _do_self_update() {
     exit 0
 }
 
+# Full-screen "What's new" view listing changes since the installed version.
+_show_changelog_screen() {
+    clear_screen
+    local term_lines row=2
+    term_lines=$(tput_lines)
+    move_to "$row" 1
+    tui "  %s  W H A T ' S   N E W  %s" "${bg_bblue}${bold}${white}" "${reset}"
+    (( row += 2 ))
+    move_to "$row" 1
+    tui '  %sInstalled:%s v%s     %sLatest:%s %sv%s%s' \
+        "${bold}${bwhite}" "${reset}" "$CM_VERSION" \
+        "${bold}${bwhite}" "${reset}" "${bgreen}${bold}" "$update_available" "${reset}"
+    (( row += 2 ))
+    move_to "$row" 1
+    tui '  %sFetching changes from GitHub…%s' "${dim}" "${reset}"
+    local _cl _line
+    _cl=$(_changelog_since_current)
+    move_to "$row" 1; clear_line
+    if [[ -n "$_cl" ]]; then
+        while IFS= read -r _line; do
+            (( row >= term_lines - 2 )) && break
+            move_to "$row" 1
+            tui '    %s•%s %s' "${bgreen}${bold}" "${reset}" "$_line"
+            (( row++ ))
+        done <<< "$_cl"
+    else
+        tui '    %s(changelog unavailable — offline or GitHub rate-limited)%s' "${dim}" "${reset}"
+    fi
+}
+
 # Key handler for 'u': apply a known update, or otherwise check for one now.
 do_update() {
     if [[ -n "$update_available" ]]; then
+        _show_changelog_screen
         local term_lines
         term_lines=$(tput_lines)
         move_to "$term_lines" 1
@@ -4568,7 +4668,7 @@ do_update() {
         tui '  %sUpdate to v%s now? Re-runs the installer. [y/N]%s ' "${byellow}${bold}" "$update_available" "${reset}"
         local ans
         IFS= read -rsn1 ans < /dev/tty
-        [[ "$ans" == "y" || "$ans" == "Y" ]] && _do_self_update
+        [[ "$ans" == "y" || "$ans" == "Y" ]] && _do_self_update quiet
         status_msg=""
         return
     fi
@@ -4604,7 +4704,7 @@ do_settings() {
     local settings_sel=0
     local settings_page=1
     local page1_count=5   # View Mode, Display Mode, Sort Mode, Hide Empty, Demo Mode
-    local page2_count=6   # Title Persistence, AI Agent, Auto-launch Agent, Match Threshold, Auto-update, Claude Helpers
+    local page2_count=7   # Title, AI Agent, Auto-launch, Match Threshold, Claude Helpers, Auto-update Check, Auto-install Updates
     _settings_status=""
     _settings_status_color=""
 
@@ -4619,6 +4719,7 @@ do_settings() {
     local _orig_hide_empty="$hide_empty"
     local _orig_match_threshold="$match_threshold"
     local _orig_auto_update_days="$auto_update_days"
+    local _orig_auto_update="$auto_update"
 
     while true; do
         local cur_count=$page1_count
@@ -4662,6 +4763,7 @@ do_settings() {
                         2) auto_claude=$(_cycle_value "$auto_claude" 1 on off) ;;
                         3) (( match_threshold < 100 )) && (( match_threshold += 5 )) ;;
                         5) auto_update_days=$(_cycle_value "$auto_update_days" 1 0 1 3 7 14 30) ;;
+                        6) auto_update=$(_cycle_value "$auto_update" 1 off on) ;;
                     esac
                 fi
                 ;;
@@ -4687,6 +4789,7 @@ do_settings() {
                         2) auto_claude=$(_cycle_value "$auto_claude" -1 on off) ;;
                         3) (( match_threshold > 0 )) && (( match_threshold -= 5 )) ;;
                         5) auto_update_days=$(_cycle_value "$auto_update_days" -1 0 1 3 7 14 30) ;;
+                        6) auto_update=$(_cycle_value "$auto_update" -1 off on) ;;
                     esac
                 fi
                 ;;
@@ -4738,6 +4841,7 @@ do_settings() {
                         hide_empty="$_orig_hide_empty"
                         match_threshold="$_orig_match_threshold"
                         auto_update_days="$_orig_auto_update_days"
+                        auto_update="$_orig_auto_update"
                         status_msg="Settings discarded"
                         status_color="${byellow}${bold}"
                         break
@@ -5428,8 +5532,10 @@ main() {
     fi
 
     # Auto-update: surface any update found previously, then kick off a fresh
-    # background check if the configured interval has elapsed.
+    # background check if the configured interval has elapsed. If auto-install is
+    # on and an update is already known, show the changes and update in place.
     _load_update_state
+    _maybe_auto_update
     _maybe_check_update
 
     hide_cursor
