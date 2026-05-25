@@ -19,6 +19,7 @@ Built with pure Bash — no dependencies beyond a standard Unix terminal.
 - **Project grouping / client billing** — organize projects into groups for tracking
 - **Auto-group detection** — automatically suggests groups based on similar project names
 - **Token usage stats** — view input, output, and cache token usage per project and per group
+- **GitHub integration** — connect your GitHub account (via the `gh` CLI), browse your repos, and open / clone / assign a local directory for each
 - **Smart project names** — ambiguous names like `pub` or `util` show parent directory context
 - Configurable title bar modes (window title, tmux split, tmux status, scroll region)
 
@@ -101,6 +102,7 @@ claudemanager myproject
 | `g` | Assign project to a group/client |
 | `G` | Group management screen |
 | `#` | Auto-detect groups from similar project names |
+| `H` | GitHub repos — browse / clone / assign / open your repos |
 | `S` | Project stats (4 pages: overview, tokens, languages, group billing) |
 
 ### Other
@@ -130,12 +132,35 @@ Organize projects into named groups for client billing or categorization:
 
 Groups are persisted in `~/.claudemanager/.claudemanager_groups`.
 
+## GitHub Integration
+
+Press `H` to open the GitHub repos screen. It connects to your GitHub account through the [`gh` CLI](https://cli.github.com) — auth is handled by `gh` (keyring/token), so claudemanager never stores credentials. If you aren't logged in, it offers to run `gh auth login` for you.
+
+The screen lists your repositories (private/public badge, language, last-updated date, description) and shows which are already cloned locally — detected from the git remotes of your tracked projects, plus any manual assignments.
+
+| Key | Action |
+|-----|--------|
+| `enter` | Open the repo in Claude Code (clones first if needed) |
+| `s` | Open a shell in the repo directory (clones first if needed) |
+| `c` | Clone the repo (prompts for destination; remembers your last clone dir) |
+| `a` | Assign an existing local directory to this repo |
+| `w` | Open the repo's GitHub page in your browser |
+| `/` | Filter repos by name/description/language |
+| `r` | Refresh the repo list |
+| `o` | List a different owner's / org's repos |
+| `q` / `esc` | Back |
+
+Clones default to `~/github/<repo>` (configurable per-clone; the last destination becomes the new default). Manual directory assignments are persisted in `~/.claudemanager/.claudemanager_gh`. Cloned and assigned repos are automatically added to claudemanager's project list.
+
+Requires the `gh` CLI (`brew install gh` on macOS).
+
 ## Requirements
 
 - Bash 4+ or Zsh
 - A terminal with ANSI color support (256-color recommended)
 - macOS or Linux
 - Claude Code CLI (optional, for launching projects)
+- GitHub CLI `gh` (optional, for the GitHub integration screen)
 
 ## License
 

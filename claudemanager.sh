@@ -23,6 +23,15 @@ DIRLIST_CACHE="$CLAUDE_BASE/.claudemanager_dirlist"
 PREFS_FILE="$CLAUDE_BASE/.claudemanager_prefs"
 HISTORY_FILE="$CLAUDE_BASE/.claudemanager_history"
 GROUPS_FILE="$CLAUDE_BASE/.claudemanager_groups"
+GH_ASSIGN_FILE="$CLAUDE_BASE/.claudemanager_gh"   # repo "owner/name<TAB>local-path" assignments
+
+# ── Version & auto-update ─────────────────────────────────────────
+CM_VERSION="2.8.0"                          # single source of truth for the version
+UPDATE_STATE_FILE="$CLAUDE_BASE/.claudemanager_update"   # last check epoch + latest known remote version
+CM_REPO_RAW="https://raw.githubusercontent.com/relipse/claudemanager/main"
+UPDATE_VERSION_URL="$CM_REPO_RAW/VERSION"   # tiny file holding just the latest version string
+UPDATE_INSTALL_URL="$CM_REPO_RAW/install.sh"
+update_available=""                         # set to the remote version when a newer release is found
 
 # ── Colors ────────────────────────────────────────────────────────
 reset=$'\e[0m'
@@ -120,6 +129,7 @@ selected=0
 scroll_offset=0
 action=""
 open_dir=""
+open_title=""           # overrides the derived terminal title when opening (e.g. from the GitHub screen)
 open_agent_override=""
 open_force_run=false
 status_msg=""
@@ -135,6 +145,8 @@ agent="claude"         # AI agent to launch: claude opencode copilot amp cursor-
 match_threshold=95     # 0-100, minimum similarity % for quick-open
 demo_mode="off"        # off | on — anonymize project names/paths for screenshots
 hide_empty="on"        # on | off — hide folders with no files
+auto_update_days=0     # 0 = off; otherwise check GitHub for a newer version every N days
+gh_clone_dir="$HOME/github"  # default destination for `gh repo clone` (remembers last choice)
 _load_prefs() {
     [[ -f "$PREFS_FILE" ]] || return 0
     while IFS='=' read -r key val; do
@@ -149,16 +161,87 @@ _load_prefs() {
             match_threshold)  match_threshold="$val" ;;
             demo_mode)        demo_mode="$val" ;;
             hide_empty)       hide_empty="$val" ;;
+            auto_update_days) auto_update_days="$val" ;;
+            gh_clone_dir)     gh_clone_dir="$val" ;;
         esac
     done < "$PREFS_FILE"
 }
 
 _save_prefs() {
-    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\ndemo_mode=%s\nagent=%s\nhide_empty=%s\n' \
-        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" "$demo_mode" "$agent" "$hide_empty" > "$PREFS_FILE"
+    printf 'view_mode=%s\ndisplay_mode=%s\nsort_mode=%s\ntitle_mode=%s\nauto_claude=%s\nmatch_threshold=%s\ndemo_mode=%s\nagent=%s\nhide_empty=%s\nauto_update_days=%s\ngh_clone_dir=%s\n' \
+        "$view_mode" "$display_mode" "$sort_mode" "$title_mode" "$auto_claude" "$match_threshold" "$demo_mode" "$agent" "$hide_empty" "$auto_update_days" "$gh_clone_dir" > "$PREFS_FILE"
 }
 
 _load_prefs
+
+# ── Auto-update: check GitHub for a newer release every N days ────
+# Returns 0 if version $1 is strictly newer than $2 (numeric dotted compare).
+_version_gt() {
+    local a="$1" b="$2"
+    [[ "$a" == "$b" ]] && return 1
+    local -a av bv
+    IFS=. read -ra av <<< "$a"
+    IFS=. read -ra bv <<< "$b"
+    local i max=${#av[@]}
+    (( ${#bv[@]} > max )) && max=${#bv[@]}
+    for (( i = 0; i < max; i++ )); do
+        local an="${av[i]:-0}" bn="${bv[i]:-0}"
+        an="${an%%[!0-9]*}"; bn="${bn%%[!0-9]*}"
+        an="${an:-0}"; bn="${bn:-0}"
+        (( 10#$an > 10#$bn )) && return 0
+        (( 10#$an < 10#$bn )) && return 1
+    done
+    return 1
+}
+
+# Read a single key=value from the update state file.
+_update_state_get() {
+    [[ -f "$UPDATE_STATE_FILE" ]] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        [[ "$k" == "$1" ]] && { printf '%s' "$v"; return 0; }
+    done < "$UPDATE_STATE_FILE"
+}
+
+# Fetch the latest published version string from GitHub (empty on failure).
+_fetch_remote_version() {
+    command -v curl >/dev/null 2>&1 || return 1
+    local v
+    v=$(curl -fsSL --max-time 6 "$UPDATE_VERSION_URL" 2>/dev/null | head -1 | tr -cd '0-9.')
+    [[ -n "$v" ]] || return 1
+    printf '%s' "$v"
+}
+
+# Background-friendly: fetch the remote version and persist it with a timestamp.
+_run_update_check() {
+    local v
+    v=$(_fetch_remote_version) || return 0
+    printf 'last_check=%s\nremote_version=%s\n' "$(date +%s)" "$v" > "$UPDATE_STATE_FILE" 2>/dev/null
+}
+
+# At startup: surface a previously-discovered update (set by an earlier check).
+_load_update_state() {
+    update_available=""
+    local remote
+    remote=$(_update_state_get remote_version)
+    [[ -n "$remote" ]] || return 0
+    _version_gt "$remote" "$CM_VERSION" && update_available="$remote"
+}
+
+# At startup: if auto-update is enabled and the interval has elapsed, kick off a
+# non-blocking background check. Its result is picked up on the next launch.
+_maybe_check_update() {
+    [[ "${auto_update_days:-0}" =~ ^[0-9]+$ ]] || return 0
+    (( auto_update_days <= 0 )) && return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    local now last
+    now=$(date +%s)
+    last=$(_update_state_get last_check)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last < auto_update_days * 86400 )) && return 0
+    ( _run_update_check ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
 
 # ── Demo mode: anonymize sensitive data for screenshots ──────────
 declare -A _demo_map=()
@@ -423,6 +506,12 @@ _refresh_sessions() {
 declare -A group_map=()        # group_map["path"] = "group_name"
 
 _load_groups
+
+# ── GitHub repos screen state ────────────────────────────────────
+declare -a _gh_name=() _gh_priv=() _gh_lang=() _gh_updated=() _gh_desc=() _gh_url=()
+declare -A _gh_local_map=()    # "owner/name" (lowercased) -> local clone path
+_gh_loaded=0                   # 1 once the repo list has been fetched this session
+_gh_owner=""                   # repo owner to list (empty = authenticated user's own repos)
 
 # ── Filtered view (indices into dirs[]) ──────────────────────────
 declare -a filtered=()
@@ -1395,7 +1484,10 @@ draw() {
     tui '                              '
     move_to 1 1
     tui '%s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
-    tui '  %sv2.6.0 · %s%s' "${dim}" "$BUILD_DATE" "${reset}"
+    tui '  %sv%s · %s%s' "${dim}" "$CM_VERSION" "$BUILD_DATE" "${reset}"
+    if [[ -n "$update_available" ]]; then
+        tui '  %s update v%s available — press u %s' "${bg_green}${black}${bold}" "$update_available" "${reset}"
+    fi
     local count_label="${#filtered[@]}"
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
@@ -1436,6 +1528,7 @@ draw() {
     _draw_btn "f"      "refresh"   "f" "${bg_magenta}" "${white}${bold}"
     _draw_btn "g"      "group"     "g" "${bg_green}"   "${black}${bold}"
     _draw_btn "#"      "auto-grp"  "#" "${bg_magenta}" "${white}${bold}"
+    _draw_btn "H"      "github"    "H" "${bg_bblue}"   "${white}${bold}"
     _draw_btn "S"      "stats"     "S" "${bg_cyan}"    "${black}${bold}"
     _draw_btn "d"      "del"       "d" "${bg_red}"     "${white}${bold}"
     _draw_btn ","      "settings"  "," "${bg_gray}"    "${bwhite}${bold}"
@@ -3382,6 +3475,393 @@ do_stats() {
     done
 }
 
+# ── GitHub integration ────────────────────────────────────────────
+# Connect to the user's GitHub account via the `gh` CLI, list their
+# repositories, and open / clone / assign a local directory for each.
+
+_gh_available() { command -v gh &>/dev/null; }
+_gh_authed()    { gh auth status &>/dev/null; }
+_gh_account()   { gh api user --jq .login 2>/dev/null; }
+
+# Normalize a git remote URL to lowercase "owner/name" for matching.
+_gh_repo_key() {
+    local u="$1"
+    u="${u%.git}"
+    u="${u#git@github.com:}"
+    u="${u#ssh://git@github.com/}"
+    u="${u#git+ssh://git@github.com/}"
+    u="${u#https://github.com/}"
+    u="${u#http://github.com/}"
+    u="${u#git://github.com/}"
+    u="${u%/}"
+    printf '%s' "${u,,}"
+}
+
+# Scan tracked project dirs for GitHub remotes + load manual assignments,
+# so the repo list can show which repos are cloned locally (and where).
+_gh_scan_local() {
+    _gh_local_map=()
+    local total=${#dirs[@]}
+    local i d cfg line url key
+    for (( i = 0; i < total; i++ )); do
+        d="${dirs[$i]}"
+        cfg="$d/.git/config"
+        [[ -f "$cfg" ]] || continue
+        line=$(grep -iE 'url[[:space:]]*=[[:space:]]*.*github\.com' "$cfg" 2>/dev/null | head -1)
+        [[ -z "$line" ]] && continue
+        url="${line#*=}"; url="${url//[[:space:]]/}"
+        key=$(_gh_repo_key "$url")
+        [[ -n "$key" && -z "${_gh_local_map[$key]:-}" ]] && _gh_local_map["$key"]="$d"
+    done
+    # Manual assignments take precedence over auto-detected remotes.
+    if [[ -f "$GH_ASSIGN_FILE" ]]; then
+        local rk rp
+        while IFS=$'\t' read -r rk rp; do
+            [[ -n "$rk" && -d "$rp" ]] && _gh_local_map["${rk,,}"]="$rp"
+        done < "$GH_ASSIGN_FILE"
+    fi
+}
+
+# Resolve the local clone path for a repo, or empty string if not cloned.
+_gh_local_path() {
+    local nameWithOwner="$1"
+    local p="${_gh_local_map[${nameWithOwner,,}]:-}"
+    if [[ -z "$p" ]]; then
+        local cand="$gh_clone_dir/${nameWithOwner##*/}"
+        [[ -d "$cand/.git" ]] && p="$cand"
+    fi
+    printf '%s' "$p"
+}
+
+# Fetch the repo list into the _gh_* arrays. Returns 1 on failure.
+_gh_fetch_repos() {
+    _gh_name=(); _gh_priv=(); _gh_lang=(); _gh_updated=(); _gh_desc=(); _gh_url=()
+    # Fields are separated by the unit-separator byte (0x1f), not a tab: tab is
+    # whitespace, and `read` with a whitespace IFS collapses empty fields, which
+    # would shift columns for repos that have no description or language.
+    local us=$'\x1f' tmpl out
+    tmpl="{{range .}}{{.nameWithOwner}}${us}{{if .isPrivate}}private{{else}}public{{end}}${us}{{if .primaryLanguage}}{{.primaryLanguage.name}}{{end}}${us}{{.updatedAt}}${us}{{if .description}}{{.description}}{{end}}${us}{{.url}}"$'\n'"{{end}}"
+    out=$(gh repo list $_gh_owner --limit 300 \
+        --json nameWithOwner,description,updatedAt,isPrivate,primaryLanguage,url \
+        --template "$tmpl" 2>/dev/null) || return 1
+    local n p l u desc url
+    while IFS="$us" read -r n p l u desc url; do
+        [[ -z "$n" ]] && continue
+        _gh_name+=("$n"); _gh_priv+=("$p"); _gh_lang+=("$l")
+        _gh_updated+=("${u:0:10}"); _gh_desc+=("$desc"); _gh_url+=("$url")
+    done <<< "$out"
+    _gh_loaded=1
+    return 0
+}
+
+# Build the visible (filtered) index list — uses do_github's locals (vis, filter).
+_gh_build_vis() {
+    vis=()
+    local i hay
+    for (( i = 0; i < ${#_gh_name[@]}; i++ )); do
+        if [[ -z "$filter" ]]; then
+            vis+=("$i")
+        else
+            hay="${_gh_name[$i]} ${_gh_desc[$i]} ${_gh_lang[$i]}"
+            [[ "${hay,,}" == *"${filter,,}"* ]] && vis+=("$i")
+        fi
+    done
+}
+
+# Open a URL in the default browser (best-effort, non-blocking).
+_gh_open_url() {
+    local url="$1"
+    [[ -z "$url" ]] && return
+    if command -v open &>/dev/null; then open "$url" &>/dev/null &
+    elif command -v xdg-open &>/dev/null; then xdg-open "$url" &>/dev/null &
+    fi
+}
+
+# Track a local directory in claudemanager (add to extra dirs, reload).
+_gh_track_dir() {
+    local path="$1"
+    path=$(realpath "$path" 2>/dev/null) || path="$path"
+    [[ -z "$path" ]] && return
+    if ! { [[ -f "$EXTRA_DIRS_FILE" ]] && grep -qxF "$path" "$EXTRA_DIRS_FILE" 2>/dev/null; }; then
+        printf '%s\n' "$path" >> "$EXTRA_DIRS_FILE"
+    fi
+    load_dirs
+    _apply_groups_to_cache
+    _apply_demo_mode
+    apply_filter
+}
+
+# Clone repo at _gh_* index $1. Returns 0 if a local clone now exists.
+_gh_do_clone() {
+    local idx="$1"
+    local name="${_gh_name[$idx]}"
+    local base="${name##*/}"
+    local dest
+    dest=$(prompt_input "Clone '$name' to: " "$gh_clone_dir/$base")
+    [[ -z "$dest" ]] && { status_msg="Clone cancelled"; status_color="$dim"; return 1; }
+    dest="${dest/#\~/$HOME}"
+
+    if [[ -d "$dest/.git" ]]; then
+        _gh_track_dir "$dest"
+        status_msg="Already cloned: $dest"; status_color="${byellow}${bold}"
+        return 0
+    fi
+    if [[ -e "$dest" && -n "$(ls -A "$dest" 2>/dev/null)" ]]; then
+        confirm "Destination exists and is not empty. Continue?" || { status_msg="Clone cancelled"; status_color="$dim"; return 1; }
+    fi
+    mkdir -p "$(dirname "$dest")" 2>/dev/null
+
+    clear_screen
+    move_to 1 1
+    show_cursor
+    tui '%s  Cloning %s%s%s into %s%s%s ...%s\n\n' "${bwhite}${bold}" "${bcyan}" "$name" "${bwhite}" "${bcyan}" "$dest" "${bwhite}" "${reset}"
+    local ok=false
+    gh repo clone "$name" "$dest" < /dev/tty && ok=true
+    hide_cursor
+
+    if $ok; then
+        local parent; parent=$(dirname "$dest")
+        if [[ "$parent" != "$gh_clone_dir" ]]; then gh_clone_dir="$parent"; _save_prefs; fi
+        _gh_track_dir "$dest"
+        status_msg="Cloned: $dest"; status_color="${bgreen}${bold}"
+        return 0
+    else
+        tui '\n%s  Clone failed.%s Press any key...' "${bred}${bold}" "${reset}"
+        IFS= read -rsn1 < /dev/tty
+        status_msg="Clone failed: $name"; status_color="${bred}${bold}"
+        return 1
+    fi
+}
+
+# Assign an existing local directory to repo at _gh_* index $1 (persisted).
+_gh_do_assign() {
+    local idx="$1"
+    local name="${_gh_name[$idx]}"
+    local base="${name##*/}"
+    local path
+    path=$(prompt_input "Assign local directory for '$name': " "$gh_clone_dir/$base")
+    [[ -z "$path" ]] && { status_msg="Assign cancelled"; status_color="$dim"; return 1; }
+    path="${path/#\~/$HOME}"
+    if [[ ! -d "$path" ]]; then
+        if confirm "Directory does not exist. Create it?"; then
+            mkdir -p "$path" || { status_msg="Could not create: $path"; status_color="${bred}${bold}"; return 1; }
+        else
+            status_msg="Not a directory: $path"; status_color="${bred}${bold}"; return 1
+        fi
+    fi
+    local rp; rp=$(realpath "$path" 2>/dev/null) || rp="$path"
+
+    # Persist the assignment (replace any prior entry for this repo).
+    local tmp="$GH_ASSIGN_FILE.tmp"; : > "$tmp"
+    if [[ -f "$GH_ASSIGN_FILE" ]]; then
+        local erk erp
+        while IFS=$'\t' read -r erk erp; do
+            [[ "${erk,,}" == "${name,,}" ]] && continue
+            printf '%s\t%s\n' "$erk" "$erp" >> "$tmp"
+        done < "$GH_ASSIGN_FILE"
+    fi
+    printf '%s\t%s\n' "$name" "$rp" >> "$tmp"
+    mv "$tmp" "$GH_ASSIGN_FILE"
+
+    _gh_track_dir "$rp"
+    _gh_local_map["${name,,}"]="$rp"
+    status_msg="Assigned $name -> $rp"; status_color="${bgreen}${bold}"
+    return 0
+}
+
+do_github() {
+    # ── Pre-flight: gh CLI installed? ──
+    if ! _gh_available; then
+        clear_screen
+        move_to 3 1
+        tui '  %s  G I T H U B  %s  The %sgh%s CLI is required.' "${bg_bblue}${bold}${white}" "${reset}" "${bwhite}${bold}" "${reset}"
+        move_to 5 1
+        tui '  Install from %shttps://cli.github.com%s then re-run.' "${bcyan}" "${reset}"
+        move_to 6 1
+        tui '  %smacOS:%s brew install gh' "${dim}" "${reset}"
+        move_to 8 1
+        tui '  %sPress any key to return...%s' "${dim}" "${reset}"
+        read_key > /dev/null
+        return
+    fi
+
+    # ── Pre-flight: authenticated? offer interactive login ──
+    if ! _gh_authed; then
+        clear_screen
+        move_to 3 1
+        tui '  %s  G I T H U B  %s  Not logged in.' "${bg_bblue}${bold}${white}" "${reset}"
+        move_to 5 1
+        show_cursor
+        tui '  Run %sgh auth login%s now? [y/N] ' "${bwhite}${bold}" "${reset}"
+        local ans; IFS= read -rsn1 ans < /dev/tty; hide_cursor
+        if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+            disable_mouse; show_cursor; clear_screen; stty sane 2>/dev/null || true
+            gh auth login < /dev/tty
+            hide_cursor; enable_mouse
+            if ! _gh_authed; then
+                status_msg="GitHub login not completed"; status_color="${byellow}${bold}"
+                return
+            fi
+        else
+            return
+        fi
+    fi
+
+    local account; account=$(_gh_account)
+
+    # ── Fetch repos (once per session; r refreshes) ──
+    if (( _gh_loaded == 0 )); then
+        clear_screen; move_to 3 1
+        tui '  %sFetching repositories...%s' "${bold}${cyan}" "${reset}"
+        if ! _gh_fetch_repos; then
+            move_to 5 1
+            tui '  %sFailed to list repositories.%s Press any key...' "${bred}${bold}" "${reset}"
+            read_key > /dev/null
+            return
+        fi
+    fi
+    _gh_scan_local
+
+    local sel=0 off=0 redraw=true filter=""
+    local -a vis=()
+    _gh_build_vis
+
+    while true; do
+        local term_lines term_cols
+        term_lines=$(tput_lines); term_cols=$(tput_cols)
+        local list_start=5 footer=2 rows_per=2
+        local max_vis=$(( (term_lines - list_start - footer) / rows_per ))
+        (( max_vis < 1 )) && max_vis=1
+
+        local count=${#vis[@]}
+        (( sel >= count )) && sel=$(( count - 1 ))
+        (( sel < 0 )) && sel=0
+        (( sel < off )) && off=$sel
+        (( sel >= off + max_vis )) && off=$(( sel - max_vis + 1 ))
+        (( off < 0 )) && off=0
+
+        if $redraw; then
+            clear_screen
+            move_to 2 1
+            local owner_label="${_gh_owner:-@$account}"
+            tui '  %s  G I T H U B  %s  %s%s%s  %s· %d repos%s' \
+                "${bg_bblue}${bold}${white}" "${reset}" \
+                "${bcyan}${bold}" "$owner_label" "${reset}" \
+                "${dim}" "$count" "${reset}"
+            if [[ -n "$filter" ]]; then
+                move_to 3 1
+                tui '  %sfilter:%s %s%s%s' "${dim}" "${reset}" "${byellow}" "$filter" "${reset}"
+            fi
+            if (( count == 0 )); then
+                move_to "$list_start" 1
+                tui '  %sNo repositories match.%s' "${dim}" "${reset}"
+            fi
+
+            local row=$list_start vi i
+            for (( vi = off; vi < off + max_vis && vi < count; vi++ )); do
+                i="${vis[$vi]}"
+                local name="${_gh_name[$i]}" priv="${_gh_priv[$i]}" lang="${_gh_lang[$i]}"
+                local date="${_gh_updated[$i]}" desc="${_gh_desc[$i]}"
+                local lpath; lpath=$(_gh_local_path "$name")
+                local dname="$name"
+                (( ${#dname} > 38 )) && dname="${dname:0:35}..."
+                local priv_badge
+                if [[ "$priv" == "private" ]]; then
+                    priv_badge="${bg_gray}${bwhite} private ${reset}"
+                else
+                    priv_badge="${bg_green}${black} public ${reset}"
+                fi
+
+                move_to "$row" 1
+                if (( vi == sel )); then
+                    tui '  %s>%s %s%-38s%s %s  %s%s%s  %s%s%s' \
+                        "${bgreen}${bold}" "${reset}" \
+                        "${bg_sel}${bold}${bwhite}" "$dname" "${reset}" "$priv_badge" \
+                        "${bmagenta}" "$lang" "${reset}" "${dim}" "$date" "${reset}"
+                else
+                    tui '    %s%-38s%s %s  %s%s%s  %s%s%s' \
+                        "${bold}${bwhite}" "$dname" "${reset}" "$priv_badge" \
+                        "${bmagenta}" "$lang" "${reset}" "${dim}" "$date" "${reset}"
+                fi
+                (( row++ ))
+
+                move_to "$row" 1
+                if [[ -n "$lpath" ]]; then
+                    tui '      %s* cloned%s %s%s%s' "${bgreen}${bold}" "${reset}" "${dim}" "$lpath" "${reset}"
+                else
+                    tui '      %s- not cloned%s' "${dim}" "${reset}"
+                    if [[ -n "$desc" ]]; then
+                        local d2="$desc" avail=$(( term_cols - 22 ))
+                        (( avail < 10 )) && avail=10
+                        (( ${#d2} > avail )) && d2="${d2:0:$(( avail - 3 ))}..."
+                        tui '  %s%s%s' "${dim}${italic}" "$d2" "${reset}"
+                    fi
+                fi
+                (( row++ ))
+            done
+
+            move_to "$term_lines" 1
+            tui '  %senter%s open  %sc%s clone  %sa%s assign  %ss%s shell  %sw%s web  %s/%s filter  %sr%s refresh  %so%s owner  %sq%s back' \
+                "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
+                "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
+                "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
+                "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
+                "${bwhite}${bold}" "${reset}"
+            redraw=false
+        fi
+
+        local key; key=$(read_key)
+        local cur=-1
+        (( count > 0 )) && cur="${vis[$sel]}"
+
+        case "$key" in
+            $'\e[A' | k) (( sel > 0 )) && (( sel-- )); redraw=true ;;
+            $'\e[B' | j) (( sel < count - 1 )) && (( sel++ )) || true; redraw=true ;;
+            $'\e[5~') (( sel -= max_vis )); (( sel < 0 )) && sel=0; redraw=true ;;
+            $'\e[6~') (( sel += max_vis )); (( sel >= count )) && sel=$(( count - 1 )); (( sel < 0 )) && sel=0; redraw=true ;;
+            /)
+                filter=$(prompt_input "filter repos: " "$filter")
+                _gh_build_vis; sel=0; off=0; redraw=true
+                ;;
+            $'\x1b')
+                if [[ -n "$filter" ]]; then filter=""; _gh_build_vis; sel=0; off=0; redraw=true; else return; fi
+                ;;
+            r)
+                clear_screen; move_to 3 1
+                tui '  %sRefreshing repositories...%s' "${bold}${cyan}" "${reset}"
+                _gh_fetch_repos; _gh_scan_local; _gh_build_vis
+                (( sel >= ${#vis[@]} )) && sel=0
+                redraw=true
+                ;;
+            o)
+                _gh_owner=$(prompt_input "GitHub owner (blank = your repos): " "$_gh_owner")
+                clear_screen; move_to 3 1
+                tui '  %sFetching repositories...%s' "${bold}${cyan}" "${reset}"
+                _gh_fetch_repos; _gh_scan_local; filter=""; _gh_build_vis; sel=0; off=0
+                redraw=true
+                ;;
+            "" | s)
+                (( cur < 0 )) && { redraw=true; continue; }
+                local oname="${_gh_name[$cur]}"
+                local olpath; olpath=$(_gh_local_path "$oname")
+                if [[ -z "$olpath" ]]; then
+                    if _gh_do_clone "$cur"; then olpath=$(_gh_local_path "$oname"); else redraw=true; continue; fi
+                fi
+                [[ -z "$olpath" ]] && { redraw=true; continue; }
+                open_dir="$olpath"
+                open_title="${oname##*/}"
+                _record_open "$open_dir"
+                if [[ "$key" == "s" ]]; then action="shell"; else action="open"; fi
+                return
+                ;;
+            c) (( cur < 0 )) && { redraw=true; continue; }; _gh_do_clone "$cur"; _gh_scan_local; redraw=true ;;
+            a) (( cur < 0 )) && { redraw=true; continue; }; _gh_do_assign "$cur"; _gh_scan_local; redraw=true ;;
+            w) (( cur < 0 )) && { redraw=true; continue; }; _gh_open_url "${_gh_url[$cur]}"; redraw=true ;;
+            q) return ;;
+        esac
+    done
+}
+
 do_about() {
     clear_screen
     local term_lines term_cols
@@ -3393,7 +3873,11 @@ do_about() {
     tui '  %s  C L A U D E   M A N A G E R  %s' "${bg_bblue}${bold}${white}" "${reset}"
     (( row += 2 ))
     move_to "$row" 1
-    tui '  %sVersion:%s  2.4.4' "${bold}${bwhite}" "${reset}"
+    if [[ -n "$update_available" ]]; then
+        tui '  %sVersion:%s  %s  %s(v%s available — press u to update)%s' "${bold}${bwhite}" "${reset}" "$CM_VERSION" "${bgreen}${bold}" "$update_available" "${reset}"
+    else
+        tui '  %sVersion:%s  %s' "${bold}${bwhite}" "${reset}" "$CM_VERSION"
+    fi
     (( row += 1 ))
     move_to "$row" 1
     # Show last modified date + relative time of the installed script
@@ -3460,7 +3944,7 @@ do_about() {
     (( row += 1 ))
     move_to "$row" 1; tui '    %sS%s      project stats               %s,%s  settings' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
-    move_to "$row" 1; tui '    %s?%s      this screen' "${bwhite}${bold}" "${reset}"
+    move_to "$row" 1; tui '    %s?%s      this screen                 %su%s  check / apply updates' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1; tui '    %sj/k%s    navigate up/down            %sq%s  quit' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
 
@@ -3946,6 +4430,21 @@ _draw_settings() {
         esac
         _draw_setting_row "$row" "$(( sel == 4 ))" "Claude Helpers" "$_helpers_val" \
             "claude-yolo  claude-edits  claude-pin  claude-help  (in ~/bin/)" "$_helpers_color"
+        (( row += (sel == 4 ? 3 : 2) ))
+
+        # 5: Auto-update
+        local au_display au_color=""
+        if (( auto_update_days <= 0 )); then
+            au_display="off"
+        elif (( auto_update_days == 1 )); then
+            au_display="daily"
+            au_color="${bgreen}${bold}"
+        else
+            au_display="every ${auto_update_days} days"
+            au_color="${bgreen}${bold}"
+        fi
+        _draw_setting_row "$row" "$(( sel == 5 ))" "Auto-update Check" "$au_display" \
+            "Check GitHub for a newer version on this schedule (off = never check)" "$au_color"
     fi
 
     # Status message
@@ -4037,11 +4536,75 @@ _settings_has_changes() {
     [[ "$match_threshold" != "$_orig_match_threshold" ]]
 }
 
+# Pull the latest release and re-run the installer, then quit so the user
+# restarts on the new version. Tears down the TUI first; writes to /dev/tty
+# because stdout is reserved for wrapper control signals.
+_do_self_update() {
+    disable_mouse 2>/dev/null || true
+    show_cursor
+    clear_screen
+    {
+        printf '\n  Updating claudemanager to v%s ...\n\n' "${update_available:-latest}"
+        if curl -fsSL "$UPDATE_INSTALL_URL" | bash; then
+            rm -f "$UPDATE_STATE_FILE" 2>/dev/null || true
+            printf '\n  \e[1;32mUpdate complete.\e[0m  Restart claudemanager to use the new version.\n'
+        else
+            printf '\n  \e[1;31mUpdate failed.\e[0m  Try the manual install one-liner from the GitHub page.\n'
+        fi
+        printf '  Press any key to exit ... '
+    } > /dev/tty 2>&1
+    IFS= read -rsn1 < /dev/tty
+    action="quit"
+    exit 0
+}
+
+# Key handler for 'u': apply a known update, or otherwise check for one now.
+do_update() {
+    if [[ -n "$update_available" ]]; then
+        local term_lines
+        term_lines=$(tput_lines)
+        move_to "$term_lines" 1
+        clear_line
+        tui '  %sUpdate to v%s now? Re-runs the installer. [y/N]%s ' "${byellow}${bold}" "$update_available" "${reset}"
+        local ans
+        IFS= read -rsn1 ans < /dev/tty
+        [[ "$ans" == "y" || "$ans" == "Y" ]] && _do_self_update
+        status_msg=""
+        return
+    fi
+    # No pending update — do a manual check right now.
+    if ! command -v curl >/dev/null 2>&1; then
+        status_msg="curl not found — cannot check for updates"
+        status_color="${byellow}${bold}"
+        return
+    fi
+    status_msg="Checking GitHub for updates…"
+    status_color="${dim}"
+    draw
+    local v
+    v=$(_fetch_remote_version)
+    if [[ -z "$v" ]]; then
+        status_msg="Update check failed (offline?)"
+        status_color="${byellow}${bold}"
+        return
+    fi
+    printf 'last_check=%s\nremote_version=%s\n' "$(date +%s)" "$v" > "$UPDATE_STATE_FILE" 2>/dev/null
+    if _version_gt "$v" "$CM_VERSION"; then
+        update_available="$v"
+        status_msg="Update available: v$v — press u to install"
+        status_color="${bgreen}${bold}"
+    else
+        update_available=""
+        status_msg="Up to date (v$CM_VERSION)"
+        status_color="${bgreen}${bold}"
+    fi
+}
+
 do_settings() {
     local settings_sel=0
     local settings_page=1
     local page1_count=5   # View Mode, Display Mode, Sort Mode, Hide Empty, Demo Mode
-    local page2_count=5   # Title Persistence, AI Agent, Auto-launch Agent, Match Threshold, Claude Helpers
+    local page2_count=6   # Title Persistence, AI Agent, Auto-launch Agent, Match Threshold, Auto-update, Claude Helpers
     _settings_status=""
     _settings_status_color=""
 
@@ -4055,6 +4618,7 @@ do_settings() {
     local _orig_demo_mode="$demo_mode"
     local _orig_hide_empty="$hide_empty"
     local _orig_match_threshold="$match_threshold"
+    local _orig_auto_update_days="$auto_update_days"
 
     while true; do
         local cur_count=$page1_count
@@ -4097,6 +4661,7 @@ do_settings() {
                         1) agent=$(_cycle_value "$agent" 1 claude claude-yolo claude-edits opencode copilot amp cursor-agent aider gemini codex) ;;
                         2) auto_claude=$(_cycle_value "$auto_claude" 1 on off) ;;
                         3) (( match_threshold < 100 )) && (( match_threshold += 5 )) ;;
+                        5) auto_update_days=$(_cycle_value "$auto_update_days" 1 0 1 3 7 14 30) ;;
                     esac
                 fi
                 ;;
@@ -4121,6 +4686,7 @@ do_settings() {
                         1) agent=$(_cycle_value "$agent" -1 claude claude-yolo claude-edits opencode copilot amp cursor-agent aider gemini codex) ;;
                         2) auto_claude=$(_cycle_value "$auto_claude" -1 on off) ;;
                         3) (( match_threshold > 0 )) && (( match_threshold -= 5 )) ;;
+                        5) auto_update_days=$(_cycle_value "$auto_update_days" -1 0 1 3 7 14 30) ;;
                     esac
                 fi
                 ;;
@@ -4171,6 +4737,7 @@ do_settings() {
                         demo_mode="$_orig_demo_mode"
                         hide_empty="$_orig_hide_empty"
                         match_threshold="$_orig_match_threshold"
+                        auto_update_days="$_orig_auto_update_days"
                         status_msg="Settings discarded"
                         status_color="${byellow}${bold}"
                         break
@@ -4860,6 +5427,11 @@ main() {
         fi
     fi
 
+    # Auto-update: surface any update found previously, then kick off a fresh
+    # background check if the configured interval has elapsed.
+    _load_update_state
+    _maybe_check_update
+
     hide_cursor
     enable_mouse
 
@@ -5010,7 +5582,9 @@ main() {
             g)            do_assign_group ;;
             G)            do_groups ;;
             '#')          do_auto_group ;;
+            H)            do_github ;;
             S)            do_stats ;;
+            u|U)          do_update ;;
             ,)            do_settings ;;
             ?)            do_about ;;
         esac
@@ -5026,12 +5600,15 @@ main() {
     if [[ -n "$result_file" ]]; then
         case "$action" in
             open)
-                local idx="${filtered[$selected]}"
+                local idx="${filtered[$selected]:-}"
                 local _effective_agent="${open_agent_override:-$agent}"
+                local _title="${open_title:-}"
+                [[ -z "$_title" && -n "$idx" ]] && _title="${cache_title[$idx]:-}"
+                [[ -z "$_title" ]] && _title="$(basename "$open_dir")"
                 printf '__CLAUDE_CD__:%s\n' "$open_dir" > "$result_file"
                 { [[ "$auto_claude" == "on" ]] || $open_force_run; } && printf '__CLAUDE_RUN__\n' >> "$result_file"
                 printf '__AGENT_CMD__:%s\n' "$_effective_agent" >> "$result_file"
-                printf '__CLAUDE_TITLE__:%s\n' "${cache_title[$idx]}" >> "$result_file"
+                printf '__CLAUDE_TITLE__:%s\n' "$_title" >> "$result_file"
                 printf '__CLAUDE_TITLE_MODE__:%s\n' "$title_mode" >> "$result_file"
                 ;;
             shell)
