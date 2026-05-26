@@ -17,9 +17,11 @@ Built with pure Bash — no dependencies beyond a standard Unix terminal.
 - Add external directories from anywhere on your system
 - Auto-detects project language (Swift, Python, JS, Go, Rust, PHP, etc.)
 - **Project grouping / client billing** — organize projects into groups for tracking
+- **Group mode** — browse your groups as folders (press `b`); open a folder to see just that group's projects
 - **Auto-group detection** — automatically suggests groups based on similar project names
 - **Token usage stats** — view input, output, and cache token usage per project and per group
-- **GitHub integration** — connect your GitHub account (via the `gh` CLI), browse your repos, and open / clone / assign a local directory for each
+- **GitHub integration** — connect your GitHub account (via the `gh` CLI), browse your repos, and open / clone / assign a local directory for each. Press `o` to switch to any organization you belong to.
+- **Multiple clones per repo** — press `C` in the GitHub view to spin up extra numbered clones (`repo-2`, `repo-3`, …) so you can run several AI agents on the same project in parallel. Repos with more than one clone show a clone count, and `enter` lets you pick which clone to open.
 - **Smart project names** — ambiguous names like `pub` or `util` show parent directory context
 - Configurable title bar modes (window title, tmux split, tmux status, scroll region)
 
@@ -92,7 +94,7 @@ claudemanager myproject
 |-----|--------|
 | `p` | Toggle local / all projects view |
 | `t` | Cycle sort mode (date, name, language) |
-| `c` | Cycle view mode (compact, full, grid) |
+| `c` | Cycle view mode (compact, full, grid, groups) |
 | `f` | Force refresh cache |
 
 ### Groups & Stats
@@ -101,8 +103,9 @@ claudemanager myproject
 |-----|--------|
 | `g` | Assign project to a group/client |
 | `G` | Group management screen |
+| `b` | Group mode — show groups as folders, open one to see its projects |
 | `#` | Auto-detect groups from similar project names |
-| `H` | GitHub repos — browse / clone / assign / open your repos |
+| `H` | GitHub repos — browse / clone / assign / open repos (press `o` to pick another org) |
 | `S` | Project stats (4 pages: overview, tokens, languages, group billing) |
 
 ### Other

@@ -26,7 +26,7 @@ GROUPS_FILE="$CLAUDE_BASE/.claudemanager_groups"
 GH_ASSIGN_FILE="$CLAUDE_BASE/.claudemanager_gh"   # repo "owner/name<TAB>local-path" assignments
 
 # ── Version & auto-update ─────────────────────────────────────────
-CM_VERSION="2.9.0"                          # single source of truth for the version
+CM_VERSION="2.11.0"                         # single source of truth for the version
 UPDATE_STATE_FILE="$CLAUDE_BASE/.claudemanager_update"   # last check epoch + latest known remote version
 CM_REPO_RAW="https://raw.githubusercontent.com/relipse/claudemanager/main"
 CM_REPO_API="https://api.github.com/repos/relipse/claudemanager"  # for the changelog
@@ -139,6 +139,9 @@ status_msg=""
 status_color="$green"
 search_query=""
 declare -a browse_stack=()   # paths drilled into via subfolder browse; empty = top-level project list
+group_mode="off"             # off | on — "group mode" view: show groups as folders, drill in to see members
+group_browse=""              # when group_mode is on: "" = showing group folders; otherwise the opened group name
+declare -a group_folders=()  # list of group names (+ __ungrouped__) shown as folders in group mode
 sort_mode="date"       # date | modified | recent | name | language
 view_mode="local"      # local | all
 display_mode="compact"  # compact | full | grid
@@ -552,7 +555,9 @@ _load_groups
 
 # ── GitHub repos screen state ────────────────────────────────────
 declare -a _gh_name=() _gh_priv=() _gh_lang=() _gh_updated=() _gh_desc=() _gh_url=()
-declare -A _gh_local_map=()    # "owner/name" (lowercased) -> local clone path
+declare -A _gh_local_map=()    # "owner/name" (lowercased) -> primary local clone path
+declare -A _gh_local_all=()    # "owner/name" (lowercased) -> newline-separated list of ALL clone paths
+_gh_last_clone_path=""         # destination of the most recent successful clone (so callers can open it)
 _gh_loaded=0                   # 1 once the repo list has been fetched this session
 _gh_owner=""                   # repo owner to list (empty = authenticated user's own repos)
 
@@ -566,6 +571,14 @@ apply_filter() {
         if [[ "$hide_empty" == "on" && "${cache_desc[$i]}" == "(empty project)" ]]; then
             continue
         fi
+        # Group mode: when a group folder is open, only show its members.
+        if [[ -n "$group_browse" ]]; then
+            if [[ "$group_browse" == "__ungrouped__" ]]; then
+                [[ -n "${cache_group[$i]:-}" ]] && continue
+            else
+                [[ "${cache_group[$i]:-}" != "$group_browse" ]] && continue
+            fi
+        fi
         if [[ -z "$search_query" ]]; then
             filtered+=("$i")
         else
@@ -577,6 +590,35 @@ apply_filter() {
             fi
         fi
     done
+}
+
+# Build the list of group "folders" shown at the top level of group mode.
+# Each entry is a group name; a trailing "__ungrouped__" pseudo-folder collects
+# any projects not assigned to a group.
+build_group_folders() {
+    group_folders=()
+    local g
+    while IFS= read -r g; do
+        [[ -n "$g" ]] && group_folders+=("$g")
+    done < <(_get_all_group_names)
+    local ung=0 i
+    for (( i = 0; i < ${#dirs[@]}; i++ )); do
+        [[ -z "${cache_group[$i]:-}" ]] && (( ung++ ))
+    done
+    (( ung > 0 )) && group_folders+=("__ungrouped__")
+}
+
+# Number of projects in a given group folder (handles __ungrouped__).
+_group_member_count() {
+    local gn="$1" c=0 i
+    for (( i = 0; i < ${#dirs[@]}; i++ )); do
+        if [[ "$gn" == "__ungrouped__" ]]; then
+            [[ -z "${cache_group[$i]:-}" ]] && (( c++ ))
+        else
+            [[ "${cache_group[$i]:-}" == "$gn" ]] && (( c++ ))
+        fi
+    done
+    printf '%d' "$c"
 }
 
 # ── Compute helpers (called once per dir at load time) ────────────
@@ -1535,7 +1577,9 @@ draw() {
     if [[ -n "$search_query" ]]; then
         count_label="${#filtered[@]}/${#dirs[@]}"
     fi
-    if (( ${#browse_stack[@]} > 0 )); then
+    if [[ "$group_mode" == "on" && -z "$group_browse" ]]; then
+        tui '  %s%s groups%s' "${dim}" "${#group_folders[@]}" "${reset}"
+    elif (( ${#browse_stack[@]} > 0 )); then
         tui '  %s%s subfolders%s' "${dim}" "$count_label" "${reset}"
     else
         tui '  %s%s projects%s' "${dim}" "$count_label" "${reset}"
@@ -1546,6 +1590,7 @@ draw() {
     [[ "$view_mode" == "all" ]] && view_label="all projects"
     local mode_label=""
     [[ "$display_mode" != "full" ]] && mode_label=" | $display_mode"
+    [[ "$group_mode" == "on" ]] && mode_label="${mode_label} | groups"
     tui '  %s[%s | sort:%s%s]%s' "${dim}${italic}" "$view_label" "$sort_mode" "$mode_label" "${reset}"
 
     # Keybindings bar — drawn via _draw_btn so clicks map back to keys
@@ -1570,6 +1615,7 @@ draw() {
     _draw_btn "R"      "rename"    "R" "${bg_cyan}"    "${black}${bold}"
     _draw_btn "f"      "refresh"   "f" "${bg_magenta}" "${white}${bold}"
     _draw_btn "g"      "group"     "g" "${bg_green}"   "${black}${bold}"
+    _draw_btn "b"      "grp view"  "b" "${bg_yellow}"  "${black}${bold}"
     _draw_btn "#"      "auto-grp"  "#" "${bg_magenta}" "${white}${bold}"
     _draw_btn "H"      "github"    "H" "${bg_bblue}"   "${white}${bold}"
     _draw_btn "S"      "stats"     "S" "${bg_cyan}"    "${black}${bold}"
@@ -1586,6 +1632,14 @@ draw() {
     if (( ${#browse_stack[@]} > 0 )); then
         move_to "$_sep_row" 1
         tui '  %sin %s%s  %s(< or esc to go up)%s' "${bcyan}${bold}" "${browse_stack[-1]}" "${reset}" "${dim}${italic}" "${reset}"
+        (( header_end++ ))
+        move_to "$header_end" 1
+    elif [[ "$group_mode" == "on" && -n "$group_browse" ]]; then
+        # Group-mode breadcrumb: inside an opened group folder
+        local _gb_label="$group_browse"
+        [[ "$group_browse" == "__ungrouped__" ]] && _gb_label="Ungrouped"
+        move_to "$_sep_row" 1
+        tui '  %s📁 %s%s  %s(< or esc to go back)%s' "${bmagenta}${bold}" "$_gb_label" "${reset}" "${dim}${italic}" "${reset}"
         (( header_end++ ))
         move_to "$header_end" 1
     fi
@@ -1609,7 +1663,60 @@ draw() {
     local list_start=$(( header_end + 1 ))
     _mouse_list_start="$list_start"
 
-    if [[ "$display_mode" == "grid" ]]; then
+    if [[ "$group_mode" == "on" && -z "$group_browse" ]]; then
+        # ── GROUP MODE: top level shows groups as folders ──
+        local _gf_row_height=2
+        _mouse_display_mode="grouplist"   # so mouse handling treats this as a single-column list
+        _mouse_row_height="$_gf_row_height"
+        _mouse_list_cols=1
+        _mouse_right_col_start=9999
+        local _gf_max_rows=$(( (effective_lines - list_start - 2) / _gf_row_height ))
+        (( _gf_max_rows < 1 )) && _gf_max_rows=1
+        _mouse_list_max_rows="$_gf_max_rows"
+
+        if (( selected < scroll_offset )); then
+            scroll_offset=$selected
+        elif (( selected >= scroll_offset + _gf_max_rows )); then
+            scroll_offset=$(( selected - _gf_max_rows + 1 ))
+        fi
+
+        if (( ${#group_folders[@]} == 0 )); then
+            move_to "$list_start" 4
+            tui '%sNo groups yet — press %sg%s%s on a project to create one.%s' \
+                "${dim}" "${bwhite}${bold}" "${reset}${dim}" "" "${reset}"
+        fi
+
+        local _gi
+        for (( _gi = 0; _gi < _gf_max_rows && _gi + scroll_offset < ${#group_folders[@]}; _gi++ )); do
+            local _gfidx=$(( _gi + scroll_offset ))
+            local _gn="${group_folders[$_gfidx]}"
+            local _glabel="$_gn"
+            [[ "$_gn" == "__ungrouped__" ]] && _glabel="Ungrouped"
+            local _gcount; _gcount=$(_group_member_count "$_gn")
+            local _grow=$(( list_start + _gi * _gf_row_height ))
+            move_to "$_grow" 1
+            if (( _gfidx == selected )); then
+                tui '  %s>%s %s📁 %s %s  %s%s project%s%s' \
+                    "${bgreen}${bold}" "${reset}" "${bg_sel}${bwhite}${bold}" "$_glabel" "${reset}" \
+                    "${dim}" "$_gcount" "$([[ "$_gcount" == "1" ]] || echo s)" "${reset}"
+            else
+                tui '  %s>%s %s📁 %s%s  %s%s project%s%s' \
+                    "${dim}" "${reset}" "${bold}${bmagenta}" "$_glabel" "${reset}" \
+                    "${dim}" "$_gcount" "$([[ "$_gcount" == "1" ]] || echo s)" "${reset}"
+            fi
+        done
+
+        if (( scroll_offset > 0 )); then
+            move_to $(( list_start - 1 )) 3
+            tui '%s^ more above%s' "${byellow}${bold}" "${reset}"
+        fi
+        if (( scroll_offset + _gf_max_rows < ${#group_folders[@]} )); then
+            local _gf_bottom=$(( list_start + _gf_max_rows * _gf_row_height ))
+            (( _gf_bottom > effective_lines - 1 )) && _gf_bottom=$(( effective_lines - 1 ))
+            move_to "$_gf_bottom" 3
+            tui '%sv more below%s' "${byellow}${bold}" "${reset}"
+        fi
+    elif [[ "$display_mode" == "grid" ]]; then
         # ── GRID MODE ──
         local cell_width=24
         local cell_height=2
@@ -1925,7 +2032,10 @@ draw() {
     fi
 
     # ── Details panel for selected item ──
-    if (( details_height > 0 && ${#filtered[@]} > 0 && selected < ${#filtered[@]} )); then
+    # (skipped at the group-folder level, where `selected` indexes groups, not projects)
+    if [[ "$group_mode" == "on" && -z "$group_browse" ]]; then
+        :
+    elif (( details_height > 0 && ${#filtered[@]} > 0 && selected < ${#filtered[@]} )); then
         local _dp_idx="${filtered[$selected]}"
         local _dp_row=$(( effective_lines + 1 ))
         local _dp_inner_w=$(( term_cols - 4 ))
@@ -2356,6 +2466,7 @@ do_refresh() {
     load_dirs "true"
     _apply_groups_to_cache
     _apply_demo_mode
+    [[ "$group_mode" == "on" ]] && build_group_folders
     selected=0
     scroll_offset=0
     status_msg="Refreshed all projects"
@@ -2383,6 +2494,20 @@ _load_subdirs() {
 
 # Drill into the selected directory, showing its subfolders as the new list.
 do_drill_in() {
+    # Group mode: at the folder level, "drill in" opens the selected group.
+    if [[ "$group_mode" == "on" && -z "$group_browse" ]]; then
+        (( ${#group_folders[@]} == 0 )) && return
+        group_browse="${group_folders[$selected]}"
+        [[ -n "$search_query" ]] && do_clear_search
+        apply_filter
+        selected=0
+        scroll_offset=0
+        local _lbl="$group_browse"
+        [[ "$group_browse" == "__ungrouped__" ]] && _lbl="Ungrouped"
+        status_msg="Group: $_lbl"
+        status_color="${bmagenta}${bold}"
+        return
+    fi
     (( ${#filtered[@]} == 0 )) && return
     local idx="${filtered[$selected]}"
     local target="${dirs[$idx]}"
@@ -2414,6 +2539,18 @@ do_drill_in() {
 
 # Go back up one level; from the top of the browse stack, return to the project list.
 do_drill_out() {
+    # Group mode: from inside a group folder, go back to the group folder list.
+    if [[ "$group_mode" == "on" && -n "$group_browse" && ${#browse_stack[@]} -eq 0 ]]; then
+        group_browse=""
+        [[ -n "$search_query" ]] && do_clear_search
+        apply_filter
+        build_group_folders
+        selected=0
+        scroll_offset=0
+        status_msg="Groups"
+        status_color="${bmagenta}${bold}"
+        return
+    fi
     (( ${#browse_stack[@]} == 0 )) && return
     unset 'browse_stack[-1]'
     [[ -n "$search_query" ]] && do_clear_search
@@ -2449,7 +2586,41 @@ do_toggle_view() {
     load_dirs
     _apply_groups_to_cache
     _apply_demo_mode
+    [[ "$group_mode" == "on" ]] && build_group_folders
     _save_prefs
+}
+
+# Toggle "group mode" — a folder-style view where each group is a folder you
+# open to see its member projects.
+do_toggle_group_view() {
+    if [[ "$group_mode" == "on" ]]; then
+        group_mode="off"
+        group_browse=""
+        apply_filter
+        status_msg="Group mode off"
+    else
+        group_mode="on"
+        group_browse=""
+        # Leaving any subfolder browse so groups span the whole project list.
+        if (( ${#browse_stack[@]} > 0 )); then
+            browse_stack=()
+            load_dirs
+            _apply_groups_to_cache
+            _apply_demo_mode
+        fi
+        [[ -n "$search_query" ]] && do_clear_search
+        apply_filter
+        build_group_folders
+        if (( ${#group_folders[@]} == 0 )); then
+            status_msg="No groups yet — press g on a project to create one"
+            status_color="${byellow}${bold}"
+        else
+            status_msg="Group mode on"
+            status_color="${bmagenta}${bold}"
+        fi
+    fi
+    selected=0
+    scroll_offset=0
 }
 
 do_toggle_sort() {
@@ -2525,10 +2696,24 @@ do_add_dir() {
 }
 
 do_toggle_compact() {
+    # `c` cycles through the views: compact → full → grid → groups → compact.
+    # (Group mode is a separate flag; `b` still toggles it directly.)
+    if [[ "$group_mode" == "on" ]]; then
+        do_toggle_group_view          # leave group view → back to compact
+        display_mode="compact"
+        scroll_offset=0
+        status_msg="View: compact"
+        status_color="${byellow}${bold}"
+        _save_prefs
+        return
+    fi
     case "$display_mode" in
         compact) display_mode="full" ;;
         full)    display_mode="grid" ;;
-        grid)    display_mode="compact" ;;
+        grid)
+            do_toggle_group_view      # enter group view (groups as folders)
+            return
+            ;;
     esac
     scroll_offset=0
     status_msg="View: $display_mode"
@@ -3526,6 +3711,74 @@ _gh_available() { command -v gh &>/dev/null; }
 _gh_authed()    { gh auth status &>/dev/null; }
 _gh_account()   { gh api user --jq .login 2>/dev/null; }
 
+# Organizations the authenticated user belongs to (one login per line).
+# Uses the memberships endpoint so it covers every org you can access, then
+# falls back to the public-orgs endpoint if that call is unavailable.
+_gh_list_orgs() {
+    local out
+    out=$(gh api --paginate /user/memberships/orgs --jq '.[].organization.login' 2>/dev/null)
+    [[ -z "$out" ]] && out=$(gh api --paginate /user/orgs --jq '.[].login' 2>/dev/null)
+    printf '%s\n' "$out" | awk 'NF' | sort -fu
+}
+
+# Interactive owner picker: lists "your repos" + each org you belong to, plus a
+# free-text option. Prints the chosen owner ("" = your own repos) on stdout, or
+# returns 1 (cancelled). $1 is the authenticated account name (for the label).
+_gh_pick_owner() {
+    local account="$1"
+    local -a owners=("") labels=("@$account  (your repos)")
+    local org
+    while IFS= read -r org; do
+        [[ -n "$org" ]] && { owners+=("$org"); labels+=("$org"); }
+    done < <(_gh_list_orgs)
+    owners+=("__CUSTOM__"); labels+=("Other owner / org (type a name)…")
+
+    local sel=0 n=${#owners[@]} redraw=true
+    # Pre-select the current owner if it matches.
+    local _i
+    for (( _i = 0; _i < n; _i++ )); do
+        [[ "${owners[$_i]}" == "$_gh_owner" ]] && sel=$_i
+    done
+
+    while true; do
+        if $redraw; then
+            clear_screen
+            move_to 2 1
+            tui '  %s  S E L E C T   O W N E R  %s  %s%d available%s' \
+                "${bg_bblue}${bold}${white}" "${reset}" "${dim}" "$(( n - 1 ))" "${reset}"
+            local row=4 j
+            for (( j = 0; j < n; j++ )); do
+                move_to "$row" 1
+                if (( j == sel )); then
+                    tui '  %s>%s %s %s %s' "${bgreen}${bold}" "${reset}" "${bg_sel}${bold}${bwhite}" "${labels[$j]}" "${reset}"
+                else
+                    tui '    %s%s%s' "${bwhite}" "${labels[$j]}" "${reset}"
+                fi
+                (( row++ ))
+            done
+            move_to $(( row + 1 )) 1
+            tui '  %sj/k%s nav  %senter%s select  %sq/esc%s cancel' \
+                "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
+                "${bwhite}${bold}" "${reset}"
+            redraw=false
+        fi
+        local key; key=$(read_key)
+        case "$key" in
+            $'\e[A' | k) (( sel > 0 )) && (( sel-- )); redraw=true ;;
+            $'\e[B' | j) (( sel < n - 1 )) && (( sel++ )); redraw=true ;;
+            q | $'\x1b') return 1 ;;
+            "")
+                local chosen="${owners[$sel]}"
+                if [[ "$chosen" == "__CUSTOM__" ]]; then
+                    chosen=$(prompt_input "GitHub owner (blank = your repos): " "$_gh_owner")
+                fi
+                printf '%s' "$chosen"
+                return 0
+                ;;
+        esac
+    done
+}
+
 # Normalize a git remote URL to lowercase "owner/name" for matching.
 _gh_repo_key() {
     local u="$1"
@@ -3542,10 +3795,35 @@ _gh_repo_key() {
 
 # Scan tracked project dirs for GitHub remotes + load manual assignments,
 # so the repo list can show which repos are cloned locally (and where).
+# Register a local clone path for a repo key (deduped). The first path seen
+# becomes the primary; every distinct path is kept in _gh_local_all.
+_gh_local_add() {
+    local key="$1" path="$2"
+    [[ -z "$key" || -z "$path" ]] && return
+    [[ -z "${_gh_local_map[$key]:-}" ]] && _gh_local_map["$key"]="$path"
+    local existing="${_gh_local_all[$key]:-}"
+    case $'\n'"$existing"$'\n' in
+        *$'\n'"$path"$'\n'*) return ;;   # already recorded
+    esac
+    if [[ -z "$existing" ]]; then
+        _gh_local_all["$key"]="$path"
+    else
+        _gh_local_all["$key"]="$existing"$'\n'"$path"
+    fi
+}
+
 _gh_scan_local() {
     _gh_local_map=()
+    _gh_local_all=()
     local total=${#dirs[@]}
     local i d cfg line url key
+    # Manual assignments first, so they become the primary clone for a repo.
+    if [[ -f "$GH_ASSIGN_FILE" ]]; then
+        local rk rp
+        while IFS=$'\t' read -r rk rp; do
+            [[ -n "$rk" && -d "$rp" ]] && _gh_local_add "${rk,,}" "$rp"
+        done < "$GH_ASSIGN_FILE"
+    fi
     for (( i = 0; i < total; i++ )); do
         d="${dirs[$i]}"
         cfg="$d/.git/config"
@@ -3554,18 +3832,11 @@ _gh_scan_local() {
         [[ -z "$line" ]] && continue
         url="${line#*=}"; url="${url//[[:space:]]/}"
         key=$(_gh_repo_key "$url")
-        [[ -n "$key" && -z "${_gh_local_map[$key]:-}" ]] && _gh_local_map["$key"]="$d"
+        _gh_local_add "$key" "$d"
     done
-    # Manual assignments take precedence over auto-detected remotes.
-    if [[ -f "$GH_ASSIGN_FILE" ]]; then
-        local rk rp
-        while IFS=$'\t' read -r rk rp; do
-            [[ -n "$rk" && -d "$rp" ]] && _gh_local_map["${rk,,}"]="$rp"
-        done < "$GH_ASSIGN_FILE"
-    fi
 }
 
-# Resolve the local clone path for a repo, or empty string if not cloned.
+# Resolve the primary local clone path for a repo, or empty string if none.
 _gh_local_path() {
     local nameWithOwner="$1"
     local p="${_gh_local_map[${nameWithOwner,,}]:-}"
@@ -3574,6 +3845,71 @@ _gh_local_path() {
         [[ -d "$cand/.git" ]] && p="$cand"
     fi
     printf '%s' "$p"
+}
+
+# All known local clone paths for a repo, one per line (may be empty).
+_gh_local_paths() {
+    printf '%s' "${_gh_local_all[${1,,}]:-}"
+}
+
+# Number of local clones tracked for a repo.
+_gh_clone_count() {
+    local v="${_gh_local_all[${1,,}]:-}"
+    [[ -z "$v" ]] && { printf '0'; return; }
+    printf '%s\n' "$v" | grep -c .
+}
+
+# A non-colliding default destination for an additional clone, e.g.
+# ~/github/sgs-2, ~/github/sgs-3, …
+_gh_next_clone_dest() {
+    local base="${1##*/}" n=2 cand
+    cand="$gh_clone_dir/${base}-${n}"
+    while [[ -e "$cand" ]]; do (( n++ )); cand="$gh_clone_dir/${base}-${n}"; done
+    printf '%s' "$cand"
+}
+
+# Interactive picker for which clone of a repo to open. Prints the chosen path,
+# or the literal "__NEW__" to request another clone; returns 1 if cancelled.
+_gh_pick_clone() {
+    local name="$1"
+    local -a paths=() labels=()
+    local p
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && { paths+=("$p"); labels+=("${p/#$HOME/~}"); }
+    done < <(_gh_local_paths "$name")
+    paths+=("__NEW__"); labels+=("＋ New clone (run another agent in parallel)…")
+
+    local sel=0 n=${#paths[@]} redraw=true
+    while true; do
+        if $redraw; then
+            clear_screen
+            move_to 2 1
+            tui '  %s  O P E N   C L O N E  %s  %s%s · %d clones%s' \
+                "${bg_bblue}${bold}${white}" "${reset}" "${bcyan}${bold}" "$name" "$(( n - 1 ))" "${reset}"
+            local row=4 j
+            for (( j = 0; j < n; j++ )); do
+                move_to "$row" 1
+                if (( j == sel )); then
+                    tui '  %s>%s %s %s %s' "${bgreen}${bold}" "${reset}" "${bg_sel}${bold}${bwhite}" "${labels[$j]}" "${reset}"
+                else
+                    tui '    %s%s%s' "${bwhite}" "${labels[$j]}" "${reset}"
+                fi
+                (( row++ ))
+            done
+            move_to $(( row + 1 )) 1
+            tui '  %sj/k%s nav  %senter%s open  %sq/esc%s cancel' \
+                "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
+                "${bwhite}${bold}" "${reset}"
+            redraw=false
+        fi
+        local key; key=$(read_key)
+        case "$key" in
+            $'\e[A' | k) (( sel > 0 )) && (( sel-- )); redraw=true ;;
+            $'\e[B' | j) (( sel < n - 1 )) && (( sel++ )); redraw=true ;;
+            q | $'\x1b') return 1 ;;
+            "") printf '%s' "${paths[$sel]}"; return 0 ;;
+        esac
+    done
 }
 
 # Fetch the repo list into the _gh_* arrays. Returns 1 on failure.
@@ -3637,15 +3973,19 @@ _gh_track_dir() {
 # Clone repo at _gh_* index $1. Returns 0 if a local clone now exists.
 _gh_do_clone() {
     local idx="$1"
+    local default_dest="${2:-}"
     local name="${_gh_name[$idx]}"
     local base="${name##*/}"
+    _gh_last_clone_path=""
+    [[ -z "$default_dest" ]] && default_dest="$gh_clone_dir/$base"
     local dest
-    dest=$(prompt_input "Clone '$name' to: " "$gh_clone_dir/$base")
+    dest=$(prompt_input "Clone '$name' to: " "$default_dest")
     [[ -z "$dest" ]] && { status_msg="Clone cancelled"; status_color="$dim"; return 1; }
     dest="${dest/#\~/$HOME}"
 
     if [[ -d "$dest/.git" ]]; then
         _gh_track_dir "$dest"
+        _gh_last_clone_path="$dest"
         status_msg="Already cloned: $dest"; status_color="${byellow}${bold}"
         return 0
     fi
@@ -3666,6 +4006,7 @@ _gh_do_clone() {
         local parent; parent=$(dirname "$dest")
         if [[ "$parent" != "$gh_clone_dir" ]]; then gh_clone_dir="$parent"; _save_prefs; fi
         _gh_track_dir "$dest"
+        _gh_last_clone_path="$dest"
         status_msg="Cloned: $dest"; status_color="${bgreen}${bold}"
         return 0
     else
@@ -3829,8 +4170,12 @@ do_github() {
                 (( row++ ))
 
                 move_to "$row" 1
-                if [[ -n "$lpath" ]]; then
-                    tui '      %s* cloned%s %s%s%s' "${bgreen}${bold}" "${reset}" "${dim}" "$lpath" "${reset}"
+                local ccount; ccount=$(_gh_clone_count "$name")
+                if (( ccount > 1 )); then
+                    tui '      %s* %d clones%s %s%s%s %s(+%d more)%s' "${bgreen}${bold}" "$ccount" "${reset}" \
+                        "${dim}" "${lpath/#$HOME/~}" "${reset}" "${dim}${italic}" "$(( ccount - 1 ))" "${reset}"
+                elif [[ -n "$lpath" ]]; then
+                    tui '      %s* cloned%s %s%s%s' "${bgreen}${bold}" "${reset}" "${dim}" "${lpath/#$HOME/~}" "${reset}"
                 else
                     tui '      %s- not cloned%s' "${dim}" "${reset}"
                     if [[ -n "$desc" ]]; then
@@ -3844,12 +4189,12 @@ do_github() {
             done
 
             move_to "$term_lines" 1
-            tui '  %senter%s open  %sc%s clone  %sa%s assign  %ss%s shell  %sw%s web  %s/%s filter  %sr%s refresh  %so%s owner  %sq%s back' \
+            tui '  %senter%s open  %sc%s clone  %sC%s +clone  %sa%s assign  %ss%s shell  %sw%s web  %s/%s filter  %sr%s refresh  %so%s owner/org  %sq%s back' \
                 "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
                 "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
                 "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
                 "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
-                "${bwhite}${bold}" "${reset}"
+                "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}"
             redraw=false
         fi
 
@@ -3877,18 +4222,42 @@ do_github() {
                 redraw=true
                 ;;
             o)
-                _gh_owner=$(prompt_input "GitHub owner (blank = your repos): " "$_gh_owner")
                 clear_screen; move_to 3 1
-                tui '  %sFetching repositories...%s' "${bold}${cyan}" "${reset}"
-                _gh_fetch_repos; _gh_scan_local; filter=""; _gh_build_vis; sel=0; off=0
+                tui '  %sLoading organizations...%s' "${bold}${cyan}" "${reset}"
+                local _new_owner
+                if _new_owner=$(_gh_pick_owner "$account"); then
+                    _gh_owner="$_new_owner"
+                    clear_screen; move_to 3 1
+                    tui '  %sFetching repositories...%s' "${bold}${cyan}" "${reset}"
+                    _gh_fetch_repos; _gh_scan_local; filter=""; _gh_build_vis; sel=0; off=0
+                fi
                 redraw=true
                 ;;
             "" | s)
                 (( cur < 0 )) && { redraw=true; continue; }
                 local oname="${_gh_name[$cur]}"
-                local olpath; olpath=$(_gh_local_path "$oname")
-                if [[ -z "$olpath" ]]; then
-                    if _gh_do_clone "$cur"; then olpath=$(_gh_local_path "$oname"); else redraw=true; continue; fi
+                local olpath="" ccount; ccount=$(_gh_clone_count "$oname")
+                if (( ccount == 0 )); then
+                    # No local clone yet → clone one.
+                    if _gh_do_clone "$cur"; then olpath="$_gh_last_clone_path"; else redraw=true; continue; fi
+                elif (( ccount == 1 )); then
+                    olpath=$(_gh_local_path "$oname")
+                else
+                    # Multiple clones → let the user choose which to open (or make a new one).
+                    local _pick
+                    if _pick=$(_gh_pick_clone "$oname"); then
+                        if [[ "$_pick" == "__NEW__" ]]; then
+                            if _gh_do_clone "$cur" "$(_gh_next_clone_dest "$oname")"; then
+                                _gh_scan_local; olpath="$_gh_last_clone_path"
+                            else
+                                redraw=true; continue
+                            fi
+                        else
+                            olpath="$_pick"
+                        fi
+                    else
+                        redraw=true; continue
+                    fi
                 fi
                 [[ -z "$olpath" ]] && { redraw=true; continue; }
                 open_dir="$olpath"
@@ -3898,6 +4267,12 @@ do_github() {
                 return
                 ;;
             c) (( cur < 0 )) && { redraw=true; continue; }; _gh_do_clone "$cur"; _gh_scan_local; redraw=true ;;
+            C)
+                # Add another clone of this repo (for running multiple agents in parallel).
+                (( cur < 0 )) && { redraw=true; continue; }
+                _gh_do_clone "$cur" "$(_gh_next_clone_dest "${_gh_name[$cur]}")"
+                _gh_scan_local; redraw=true
+                ;;
             a) (( cur < 0 )) && { redraw=true; continue; }; _gh_do_assign "$cur"; _gh_scan_local; redraw=true ;;
             w) (( cur < 0 )) && { redraw=true; continue; }; _gh_open_url "${_gh_url[$cur]}"; redraw=true ;;
             q) return ;;
@@ -3975,7 +4350,7 @@ do_about() {
     (( row += 1 ))
     move_to "$row" 1; tui '    %sR%s      smart rename directory      %se%s  edit description' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
-    move_to "$row" 1; tui '    %sc%s      cycle view mode             %sp%s  toggle local/all view' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    move_to "$row" 1; tui '    %sc%s      cycle view (compact/full/grid/groups)  %sp%s  toggle local/all view' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1; tui '    %st%s      cycle sort mode             %sa%s  add external directory' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
@@ -3983,7 +4358,7 @@ do_about() {
     (( row += 1 ))
     move_to "$row" 1; tui '    %sg%s      assign group/client         %sG%s  group management' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
-    move_to "$row" 1; tui '    %s#%s      auto-detect groups' "${bwhite}${bold}" "${reset}"
+    move_to "$row" 1; tui '    %sb%s      group mode (groups as folders) %s#%s  auto-detect groups' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1; tui '    %sS%s      project stats               %s,%s  settings' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
@@ -5553,6 +5928,9 @@ main() {
             local _coords="${_body%[Mm]}"
             local _btn _col _row
             IFS=";" read -r _btn _col _row <<< "$_coords"
+            # Item count for the active list (group folders vs. projects).
+            local _m_count=${#filtered[@]}
+            [[ "$group_mode" == "on" && -z "$group_browse" ]] && _m_count=${#group_folders[@]}
             case "$_btn" in
                 64) # wheel up
                     if [[ "$_mouse_display_mode" == "grid" ]]; then
@@ -5566,7 +5944,7 @@ main() {
                     if [[ "$_mouse_display_mode" == "grid" ]]; then
                         (( selected + _mouse_grid_cols < ${#filtered[@]} )) && (( selected += _mouse_grid_cols )) || true
                     else
-                        (( selected < ${#filtered[@]} - 1 )) && (( selected++ )) || true
+                        (( selected < _m_count - 1 )) && (( selected++ )) || true
                     fi
                     continue
                     ;;
@@ -5598,7 +5976,7 @@ main() {
                                     _cidx=$(( scroll_offset + _lr + _lc * _mouse_list_max_rows ))
                                 fi
                             fi
-                            if (( _cidx >= 0 && _cidx < ${#filtered[@]} )); then
+                            if (( _cidx >= 0 && _cidx < _m_count )); then
                                 if (( _cidx == selected )); then
                                     # Click on already-selected item → treat as Enter
                                     key=""
@@ -5627,23 +6005,43 @@ main() {
             (( nav_grid_cols < 1 )) && nav_grid_cols=1
         fi
 
+        # Group-folder level: navigate the group list, not the project list.
+        local _in_gf=false
+        [[ "$group_mode" == "on" && -z "$group_browse" ]] && _in_gf=true
+        local _nav_count=${#filtered[@]}
+        $_in_gf && _nav_count=${#group_folders[@]}
+
+        # At the group-folder level `selected` indexes groups, not projects, so
+        # actions that operate on a project would target the wrong one — block them.
+        if $_in_gf; then
+            case "$key" in
+                r|R|m|e|d|s|A|g|'#')
+                    status_msg="Open a group folder first (enter)"
+                    status_color="${byellow}${bold}"
+                    continue
+                    ;;
+            esac
+        fi
+
         case "$key" in
             $'\e[A' | k)
-                if [[ "$display_mode" == "grid" ]]; then
+                if [[ "$display_mode" == "grid" && $_in_gf == false ]]; then
                     (( selected >= nav_grid_cols )) && (( selected -= nav_grid_cols ))
                 else
                     (( selected > 0 )) && (( selected-- ))
                 fi
                 ;;
             $'\e[B' | j)
-                if [[ "$display_mode" == "grid" ]]; then
+                if [[ "$display_mode" == "grid" && $_in_gf == false ]]; then
                     (( selected + nav_grid_cols < ${#filtered[@]} )) && (( selected += nav_grid_cols )) || true
                 else
-                    (( selected < ${#filtered[@]} - 1 )) && (( selected++ )) || true
+                    (( selected < _nav_count - 1 )) && (( selected++ )) || true
                 fi
                 ;;
             $'\e[D' | h)
-                if [[ "$display_mode" == "grid" ]]; then
+                if [[ $_in_gf == true ]]; then
+                    do_drill_out
+                elif [[ "$display_mode" == "grid" ]]; then
                     (( selected > 0 )) && (( selected-- ))
                 elif [[ "$display_mode" == "compact" && _mouse_list_cols == 2 ]]; then
                     local _pos=$(( selected - scroll_offset ))
@@ -5654,7 +6052,9 @@ main() {
                 fi
                 ;;
             $'\e[C' | l)
-                if [[ "$display_mode" == "grid" ]]; then
+                if [[ $_in_gf == true ]]; then
+                    do_drill_in
+                elif [[ "$display_mode" == "grid" ]]; then
                     (( selected < ${#filtered[@]} - 1 )) && (( selected++ )) || true
                 elif [[ "$display_mode" == "compact" && _mouse_list_cols == 2 ]]; then
                     local _pos=$(( selected - scroll_offset ))
@@ -5665,12 +6065,12 @@ main() {
                 fi
                 ;;
             $'\e[5~')     (( selected -= 5 )); (( selected < 0 )) && selected=0 ;;
-            $'\e[6~')     (( selected += 5 )); (( selected >= ${#filtered[@]} )) && selected=$(( ${#filtered[@]} - 1 )); (( selected < 0 )) && selected=0 ;;
-            "")           do_open ;;
+            $'\e[6~')     (( selected += 5 )); (( selected >= _nav_count )) && selected=$(( _nav_count - 1 )); (( selected < 0 )) && selected=0 ;;
+            "")           if [[ $_in_gf == true ]]; then do_drill_in; else do_open; fi ;;
             ">")          do_drill_in ;;
             "<")          do_drill_out ;;
             /)            do_search ;;
-            $'\x1b')      if [[ -n "$search_query" ]]; then do_clear_search; elif (( ${#browse_stack[@]} > 0 )); then do_drill_out; else do_about; fi ;;
+            $'\x1b')      if [[ -n "$search_query" ]]; then do_clear_search; elif (( ${#browse_stack[@]} > 0 )); then do_drill_out; elif [[ "$group_mode" == "on" && -n "$group_browse" ]]; then do_drill_out; else do_about; fi ;;
             n)            do_new ;;
             N)            do_new_with ;;
             r)            do_rename ;;
@@ -5687,6 +6087,7 @@ main() {
             f)            do_refresh ;;
             g)            do_assign_group ;;
             G)            do_groups ;;
+            b)            do_toggle_group_view ;;
             '#')          do_auto_group ;;
             H)            do_github ;;
             S)            do_stats ;;
