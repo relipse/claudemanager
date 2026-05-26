@@ -21,7 +21,8 @@ Built with pure Bash — no dependencies beyond a standard Unix terminal.
 - **Auto-group detection** — automatically suggests groups based on similar project names
 - **Token usage stats** — view input, output, and cache token usage per project and per group
 - **GitHub integration** — connect your GitHub account (via the `gh` CLI), browse your repos, and open / clone / assign a local directory for each. Press `o` to switch to any organization you belong to.
-- **Multiple clones per repo** — press `C` in the GitHub view to spin up extra numbered clones (`repo-2`, `repo-3`, …) so you can run several AI agents on the same project in parallel. Repos with more than one clone show a clone count, and `enter` lets you pick which clone to open.
+- **Multiple clones per repo** — press `C` in the GitHub view to spin up extra numbered clones (`repo-2`, `repo-3`, …) so you can run several AI agents on the same project in parallel. Repos with more than one clone show a clone count, and `enter` lets you pick which clone to open. When a local copy already exists, the extra clone is made **from that local copy** (`git clone` of the on-disk repo — fast and offline) instead of re-downloading from GitHub.
+- **Local project clone** — press `C` on any local git project to clone it into a numbered sibling, copying only git-tracked content (like `cp -r` but skipping `node_modules`, build output, and other untracked files). Same parallel-agent workflow, no GitHub required.
 - **Smart project names** — ambiguous names like `pub` or `util` show parent directory context
 - Configurable title bar modes (window title, tmux split, tmux status, scroll region)
 
@@ -83,6 +84,7 @@ claudemanager myproject
 | `n` | Create new project |
 | `r` | Set display title |
 | `R` | Smart rename directory |
+| `C` | Clone project (git-tracked files only) into a numbered sibling |
 | `m` | Rename directory |
 | `e` | Edit description |
 | `d` | Delete project |

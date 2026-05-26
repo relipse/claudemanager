@@ -26,7 +26,7 @@ GROUPS_FILE="$CLAUDE_BASE/.claudemanager_groups"
 GH_ASSIGN_FILE="$CLAUDE_BASE/.claudemanager_gh"   # repo "owner/name<TAB>local-path" assignments
 
 # ── Version & auto-update ─────────────────────────────────────────
-CM_VERSION="2.11.0"                         # single source of truth for the version
+CM_VERSION="2.13.0"                         # single source of truth for the version
 UPDATE_STATE_FILE="$CLAUDE_BASE/.claudemanager_update"   # last check epoch + latest known remote version
 CM_REPO_RAW="https://raw.githubusercontent.com/relipse/claudemanager/main"
 CM_REPO_API="https://api.github.com/repos/relipse/claudemanager"  # for the changelog
@@ -1613,6 +1613,7 @@ draw() {
     _draw_btn "c"      "view"      "c" "${bg_yellow}"  "${black}${bold}"
     _draw_btn "a"      "add"       "a" "${bg_green}"   "${black}${bold}"
     _draw_btn "R"      "rename"    "R" "${bg_cyan}"    "${black}${bold}"
+    _draw_btn "C"      "clone"     "C" "${bg_green}"   "${black}${bold}"
     _draw_btn "f"      "refresh"   "f" "${bg_magenta}" "${white}${bold}"
     _draw_btn "g"      "group"     "g" "${bg_green}"   "${black}${bold}"
     _draw_btn "b"      "grp view"  "b" "${bg_yellow}"  "${black}${bold}"
@@ -2693,6 +2694,84 @@ do_add_dir() {
         status_msg="Added: $entry"
     fi
     status_color="${bgreen}${bold}"
+}
+
+# Core local-clone routine: `git clone` from a local source dir into $dest
+# (only git-tracked content, no untracked cruft), then track + reload so the new
+# clone shows up. Sets _gh_last_clone_path on success. Returns 0 on success.
+# This is fast and works offline, since it copies from a directory already on disk.
+_clone_local_git() {
+    local src="$1" dest="$2" label="${3:-${src##*/}}"
+    _gh_last_clone_path=""
+    if [[ -e "$dest" ]]; then
+        status_msg="Destination already exists: ${dest/#$HOME/~}"; status_color="${bred}${bold}"; return 1
+    fi
+    mkdir -p "$(dirname "$dest")" 2>/dev/null
+
+    clear_screen; move_to 1 1; show_cursor
+    tui '%s  Cloning %s%s%s → %s%s%s  (local copy, git-tracked only — offline) ...%s\n\n' \
+        "${bwhite}${bold}" "${bcyan}" "$label" "${bwhite}" "${bcyan}" "${dest/#$HOME/~}" "${bwhite}" "${reset}"
+    local ok=false
+    git clone "$src" "$dest" < /dev/tty && ok=true
+    hide_cursor
+
+    if $ok; then
+        _gh_last_clone_path="$dest"
+        # Track it so it appears in the list (auto-discovered if under CLAUDE_BASE).
+        local rp; rp=$(realpath "$dest" 2>/dev/null) || rp="$dest"
+        if [[ "$rp" != "$CLAUDE_BASE/"* ]]; then
+            if ! { [[ -f "$EXTRA_DIRS_FILE" ]] && grep -qxF "$rp" "$EXTRA_DIRS_FILE" 2>/dev/null; }; then
+                printf '%s\n' "$rp" >> "$EXTRA_DIRS_FILE"
+            fi
+        fi
+        load_dirs
+        _apply_groups_to_cache
+        _apply_demo_mode
+        [[ "$group_mode" == "on" ]] && build_group_folders
+        apply_filter
+        status_msg="Cloned (offline) to ${dest/#$HOME/~}"; status_color="${bgreen}${bold}"
+        return 0
+    fi
+    tui '\n%s  Clone failed.%s Press any key...' "${bred}${bold}" "${reset}"
+    IFS= read -rsn1 < /dev/tty
+    status_msg="Clone failed: $label"; status_color="${bred}${bold}"
+    return 1
+}
+
+# A non-colliding numbered sibling for $1 (foo → foo-2, foo-3, …), collapsing
+# any existing -N suffix so clones of clones stay tidy.
+_local_next_clone_dest() {
+    local src="$1" parent base stem n cand
+    parent=$(dirname "$src")
+    base="${src##*/}"
+    stem="${base%-[0-9]*}"
+    [[ -n "$stem" ]] && base="$stem"
+    n=2; cand="$parent/${base}-${n}"
+    while [[ -e "$cand" ]]; do (( n++ )); cand="$parent/${base}-${n}"; done
+    printf '%s' "$cand"
+}
+
+# Clone the selected local project into a new numbered sibling, copying only
+# git-tracked content (via `git clone`, not `cp -r`). Handy for running several
+# AI agents on the same codebase in parallel without dragging along build
+# artifacts, node_modules, or other untracked cruft.
+do_clone_local() {
+    (( ${#filtered[@]} == 0 )) && return
+    local idx="${filtered[$selected]}"
+    local src="${dirs[$idx]}"
+    local title="${cache_title[$idx]:-${src##*/}}"
+
+    if [[ ! -d "$src/.git" ]]; then
+        status_msg="Not a git repo — local clone copies git-tracked files only"
+        status_color="${byellow}${bold}"
+        return
+    fi
+
+    local dest
+    dest=$(prompt_input "Clone '$title' (git-tracked only) to: " "$(_local_next_clone_dest "$src")")
+    [[ -z "$dest" ]] && { status_msg="Clone cancelled"; status_color="$dim"; return; }
+    dest="${dest/#\~/$HOME}"
+    _clone_local_git "$src" "$dest" "$title"
 }
 
 do_toggle_compact() {
@@ -3877,7 +3956,7 @@ _gh_pick_clone() {
     while IFS= read -r p; do
         [[ -n "$p" ]] && { paths+=("$p"); labels+=("${p/#$HOME/~}"); }
     done < <(_gh_local_paths "$name")
-    paths+=("__NEW__"); labels+=("＋ New clone (run another agent in parallel)…")
+    paths+=("__NEW__"); labels+=("＋ New clone from local copy (fast/offline — run another agent)…")
 
     local sel=0 n=${#paths[@]} redraw=true
     while true; do
@@ -4015,6 +4094,25 @@ _gh_do_clone() {
         status_msg="Clone failed: $name"; status_color="${bred}${bold}"
         return 1
     fi
+}
+
+# Create another clone of the repo at _gh_* index $1. If a local clone already
+# exists, clone from that copy (fast, offline) rather than re-downloading from
+# GitHub; otherwise fall back to `gh repo clone`. Returns 0 on success.
+_gh_new_clone() {
+    local idx="$1"
+    local name="${_gh_name[$idx]}"
+    local src; src=$(_gh_local_path "$name")
+    if [[ -n "$src" && -d "$src/.git" ]]; then
+        local dest
+        dest=$(prompt_input "New clone of '$name' (from local copy, offline) to: " "$(_local_next_clone_dest "$src")")
+        [[ -z "$dest" ]] && { status_msg="Clone cancelled"; status_color="$dim"; return 1; }
+        dest="${dest/#\~/$HOME}"
+        _clone_local_git "$src" "$dest" "$name"
+        return $?
+    fi
+    # No local copy yet → clone from GitHub.
+    _gh_do_clone "$idx" "$(_gh_next_clone_dest "$name")"
 }
 
 # Assign an existing local directory to repo at _gh_* index $1 (persisted).
@@ -4247,7 +4345,7 @@ do_github() {
                     local _pick
                     if _pick=$(_gh_pick_clone "$oname"); then
                         if [[ "$_pick" == "__NEW__" ]]; then
-                            if _gh_do_clone "$cur" "$(_gh_next_clone_dest "$oname")"; then
+                            if _gh_new_clone "$cur"; then
                                 _gh_scan_local; olpath="$_gh_last_clone_path"
                             else
                                 redraw=true; continue
@@ -4269,8 +4367,9 @@ do_github() {
             c) (( cur < 0 )) && { redraw=true; continue; }; _gh_do_clone "$cur"; _gh_scan_local; redraw=true ;;
             C)
                 # Add another clone of this repo (for running multiple agents in parallel).
+                # Prefers cloning from an existing local copy (fast/offline).
                 (( cur < 0 )) && { redraw=true; continue; }
-                _gh_do_clone "$cur" "$(_gh_next_clone_dest "${_gh_name[$cur]}")"
+                _gh_new_clone "$cur"
                 _gh_scan_local; redraw=true
                 ;;
             a) (( cur < 0 )) && { redraw=true; continue; }; _gh_do_assign "$cur"; _gh_scan_local; redraw=true ;;
@@ -4349,6 +4448,8 @@ do_about() {
     move_to "$row" 1; tui '    %sr%s      set display title           %sm%s  rename directory' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1; tui '    %sR%s      smart rename directory      %se%s  edit description' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    (( row += 1 ))
+    move_to "$row" 1; tui '    %sC%s      clone project (git-tracked files only)' "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1; tui '    %sc%s      cycle view (compact/full/grid/groups)  %sp%s  toggle local/all view' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
@@ -6015,7 +6116,7 @@ main() {
         # actions that operate on a project would target the wrong one — block them.
         if $_in_gf; then
             case "$key" in
-                r|R|m|e|d|s|A|g|'#')
+                r|R|m|e|d|s|A|g|C|'#')
                     status_msg="Open a group folder first (enter)"
                     status_color="${byellow}${bold}"
                     continue
@@ -6075,6 +6176,7 @@ main() {
             N)            do_new_with ;;
             r)            do_rename ;;
             R)            do_smart_rename ;;
+            C)            do_clone_local ;;
             m)            do_move_dir ;;
             e)            do_edit_desc ;;
             d)            do_delete ;;
