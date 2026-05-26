@@ -24,9 +24,11 @@ PREFS_FILE="$CLAUDE_BASE/.claudemanager_prefs"
 HISTORY_FILE="$CLAUDE_BASE/.claudemanager_history"
 GROUPS_FILE="$CLAUDE_BASE/.claudemanager_groups"
 GH_ASSIGN_FILE="$CLAUDE_BASE/.claudemanager_gh"   # repo "owner/name<TAB>local-path" assignments
+GH_REPO_CACHE_DIR="$CLAUDE_BASE/.claudemanager_gh_cache"  # cached `gh repo list` output, one file per owner
+GH_REPO_CACHE_TTL=$(( 24 * 3600 ))               # serve cached repos for this long before re-hitting the network
 
 # ── Version & auto-update ─────────────────────────────────────────
-CM_VERSION="2.13.0"                         # single source of truth for the version
+CM_VERSION="2.15.0"                         # single source of truth for the version
 UPDATE_STATE_FILE="$CLAUDE_BASE/.claudemanager_update"   # last check epoch + latest known remote version
 CM_REPO_RAW="https://raw.githubusercontent.com/relipse/claudemanager/main"
 CM_REPO_API="https://api.github.com/repos/relipse/claudemanager"  # for the changelog
@@ -560,6 +562,8 @@ declare -A _gh_local_all=()    # "owner/name" (lowercased) -> newline-separated 
 _gh_last_clone_path=""         # destination of the most recent successful clone (so callers can open it)
 _gh_loaded=0                   # 1 once the repo list has been fetched this session
 _gh_owner=""                   # repo owner to list (empty = authenticated user's own repos)
+_gh_from_cache=0               # 1 if the current list was served from the on-disk cache
+_gh_cache_age=0                # age (seconds) of the cache the current list came from
 
 # ── Filtered view (indices into dirs[]) ──────────────────────────
 declare -a filtered=()
@@ -619,6 +623,39 @@ _group_member_count() {
         fi
     done
     printf '%d' "$c"
+}
+
+# Comma-separated member project titles for a group folder (for the info line).
+_group_member_titles() {
+    local gn="$1" out="" i
+    for (( i = 0; i < ${#dirs[@]}; i++ )); do
+        local match=false
+        if [[ "$gn" == "__ungrouped__" ]]; then
+            [[ -z "${cache_group[$i]:-}" ]] && match=true
+        else
+            [[ "${cache_group[$i]:-}" == "$gn" ]] && match=true
+        fi
+        $match || continue
+        [[ -n "$out" ]] && out+=", "
+        out+="${cache_title[$i]}"
+    done
+    printf '%s' "$out"
+}
+
+# Rename a group everywhere it appears (assignments + in-memory caches).
+_rename_group() {
+    local old="$1" new="$2"
+    [[ -z "$new" || "$new" == "$old" ]] && return 1
+    local path
+    for path in "${!group_map[@]}"; do
+        [[ "${group_map[$path]}" == "$old" ]] && group_map["$path"]="$new"
+    done
+    local i
+    for (( i = 0; i < ${#dirs[@]}; i++ )); do
+        [[ "${cache_group[$i]:-}" == "$old" ]] && cache_group[$i]="$new"
+    done
+    _save_groups
+    return 0
 }
 
 # ── Compute helpers (called once per dir at load time) ────────────
@@ -1704,6 +1741,15 @@ draw() {
                 tui '  %s>%s %s📁 %s%s  %s%s project%s%s' \
                     "${dim}" "${reset}" "${bold}${bmagenta}" "$_glabel" "${reset}" \
                     "${dim}" "$_gcount" "$([[ "$_gcount" == "1" ]] || echo s)" "${reset}"
+            fi
+            # Info line (member project titles) when the 2-row layout leaves room.
+            local _gtitles; _gtitles=$(_group_member_titles "$_gn")
+            if [[ -n "$_gtitles" ]]; then
+                local _gmaxw=$(( term_cols - 8 ))
+                (( _gmaxw < 10 )) && _gmaxw=10
+                (( ${#_gtitles} > _gmaxw )) && _gtitles="${_gtitles:0:$(( _gmaxw - 1 ))}…"
+                move_to $(( _grow + 1 )) 1
+                tui '       %s%s%s' "${dim}${italic}" "$_gtitles" "${reset}"
             fi
         done
 
@@ -3872,6 +3918,30 @@ _gh_repo_key() {
     printf '%s' "${u,,}"
 }
 
+# Resolve a git dir to its "owner/name" GitHub key, following local-path
+# origins transitively. A clone made FROM a local copy has its origin set to
+# that local path (not github.com), so we chase the origin chain until we hit a
+# real GitHub URL. Prints the key, or returns 1 if none found. $2 = recursion depth.
+_gh_resolve_key() {
+    local d="$1" depth="${2:-0}"
+    (( depth > 6 )) && return 1
+    local cfg="$d/.git/config"
+    [[ -f "$cfg" ]] || return 1
+    local line url
+    line=$(grep -iE '^[[:space:]]*url[[:space:]]*=' "$cfg" 2>/dev/null | head -1)
+    [[ -z "$line" ]] && return 1
+    url="${line#*=}"; url="${url//[[:space:]]/}"
+    if [[ "$url" == *github.com* ]]; then
+        _gh_repo_key "$url"; return 0
+    fi
+    # Origin is a local path (or file:// URL) → resolve that copy's origin.
+    local lp="$url"
+    lp="${lp#file://}"
+    lp="${lp/#\~/$HOME}"
+    [[ -d "$lp" ]] || return 1
+    _gh_resolve_key "$lp" $(( depth + 1 ))
+}
+
 # Scan tracked project dirs for GitHub remotes + load manual assignments,
 # so the repo list can show which repos are cloned locally (and where).
 # Register a local clone path for a repo key (deduped). The first path seen
@@ -3905,12 +3975,8 @@ _gh_scan_local() {
     fi
     for (( i = 0; i < total; i++ )); do
         d="${dirs[$i]}"
-        cfg="$d/.git/config"
-        [[ -f "$cfg" ]] || continue
-        line=$(grep -iE 'url[[:space:]]*=[[:space:]]*.*github\.com' "$cfg" 2>/dev/null | head -1)
-        [[ -z "$line" ]] && continue
-        url="${line#*=}"; url="${url//[[:space:]]/}"
-        key=$(_gh_repo_key "$url")
+        [[ -d "$d/.git" ]] || continue
+        key=$(_gh_resolve_key "$d") || continue
         _gh_local_add "$key" "$d"
     done
 }
@@ -3947,69 +4013,269 @@ _gh_next_clone_dest() {
     printf '%s' "$cand"
 }
 
-# Interactive picker for which clone of a repo to open. Prints the chosen path,
-# or the literal "__NEW__" to request another clone; returns 1 if cancelled.
+# Interactive menu listing every local clone of a repo, plus actions to make a
+# new clone, search the disk for more clones, or group all clones together.
+# Prints the chosen selection on stdout — a clone path, or one of "__NEW__",
+# "__SCAN__", "__GROUP__" — for the caller to act on; returns 1 if cancelled.
+# (Drawing goes to the tty, so this is safe to call inside $(...); the caller
+# must perform any state-changing action, since $(...) runs in a subshell.)
+# $2 is an optional one-line note to show under the header.
 _gh_pick_clone() {
-    local name="$1"
+    local name="$1" note="${2:-}"
     local -a paths=() labels=()
     local p
     while IFS= read -r p; do
         [[ -n "$p" ]] && { paths+=("$p"); labels+=("${p/#$HOME/~}"); }
     done < <(_gh_local_paths "$name")
-    paths+=("__NEW__"); labels+=("＋ New clone from local copy (fast/offline — run another agent)…")
+    local ccount=${#paths[@]}
+    paths+=("__NEW__");   labels+=("＋ New clone (run another agent in parallel)…")
+    paths+=("__SCAN__");  labels+=("🔍 Search disk for more clones of this repo")
+    paths+=("__GROUP__"); labels+=("📁 Add all clones to a group (new or existing)…")
+    local n=${#paths[@]} sel=0
 
-    local sel=0 n=${#paths[@]} redraw=true
     while true; do
-        if $redraw; then
-            clear_screen
-            move_to 2 1
-            tui '  %s  O P E N   C L O N E  %s  %s%s · %d clones%s' \
-                "${bg_bblue}${bold}${white}" "${reset}" "${bcyan}${bold}" "$name" "$(( n - 1 ))" "${reset}"
-            local row=4 j
-            for (( j = 0; j < n; j++ )); do
-                move_to "$row" 1
-                if (( j == sel )); then
-                    tui '  %s>%s %s %s %s' "${bgreen}${bold}" "${reset}" "${bg_sel}${bold}${bwhite}" "${labels[$j]}" "${reset}"
-                else
-                    tui '    %s%s%s' "${bwhite}" "${labels[$j]}" "${reset}"
-                fi
-                (( row++ ))
-            done
-            move_to $(( row + 1 )) 1
-            tui '  %sj/k%s nav  %senter%s open  %sq/esc%s cancel' \
-                "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
-                "${bwhite}${bold}" "${reset}"
-            redraw=false
+        clear_screen
+        move_to 2 1
+        tui '  %s  C L O N E S  %s  %s%s · %d clone%s%s' \
+            "${bg_bblue}${bold}${white}" "${reset}" "${bcyan}${bold}" "$name" "$ccount" "$([[ "$ccount" == "1" ]] || echo s)" "${reset}"
+        if [[ -n "$note" ]]; then
+            move_to 3 1; tui '  %s%s%s' "${bgreen}${italic}" "$note" "${reset}"
         fi
+        local row=4 j
+        for (( j = 0; j < n; j++ )); do
+            move_to "$row" 1
+            if (( j == sel )); then
+                tui '  %s>%s %s %s %s' "${bgreen}${bold}" "${reset}" "${bg_sel}${bold}${bwhite}" "${labels[$j]}" "${reset}"
+            else
+                tui '    %s%s%s' "${bwhite}" "${labels[$j]}" "${reset}"
+            fi
+            (( row++ ))
+        done
+        move_to $(( row + 1 )) 1
+        tui '  %sj/k%s nav  %senter%s select  %sq/esc%s cancel' \
+            "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
+            "${bwhite}${bold}" "${reset}"
+
         local key; key=$(read_key)
         case "$key" in
-            $'\e[A' | k) (( sel > 0 )) && (( sel-- )); redraw=true ;;
-            $'\e[B' | j) (( sel < n - 1 )) && (( sel++ )); redraw=true ;;
+            $'\e[A' | k) (( sel > 0 )) && (( sel-- )) ;;
+            $'\e[B' | j) (( sel < n - 1 )) && (( sel++ )) ;;
             q | $'\x1b') return 1 ;;
             "") printf '%s' "${paths[$sel]}"; return 0 ;;
         esac
     done
 }
 
-# Fetch the repo list into the _gh_* arrays. Returns 1 on failure.
-_gh_fetch_repos() {
+# Search the disk for directories that are clones of repo $1 but aren't tracked
+# yet, and register them. Looks in: the configured clone dir, the parent folders
+# of any clones already known, and a set of common project roots (~/github,
+# ~/Sites, ~/Projects, …) — each searched a few levels deep so clones in
+# subfolders are found too. Sets _gh_scan_added to the number newly added. Call
+# directly (not in a $() subshell), since it reloads the in-memory project list.
+_gh_scan_added=0
+_gh_scan_for_clones() {
+    local name="$1"
+    local target_key="${name,,}"
+    local -A seen_root=()
+    local -a roots=()
+    local r
+    # 1) The configured clone destination.
+    roots+=("$gh_clone_dir")
+    # 2) Parent folders of clones we already track.
+    local p par
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && roots+=("$(dirname "$p")")
+    done < <(_gh_local_paths "$name")
+    # 3) Common project roots people keep clones in.
+    for r in github Sites Projects projects src code dev Developer repos work Documents/GitHub; do
+        roots+=("$HOME/$r")
+    done
+
+    # Collect candidate clone dirs by finding .git dirs a few levels under each
+    # root, deduped by real path. maxdepth 4 reaches root/group/repo/.git.
+    local -A seen_dir=()
+    local -a cands=()
+    local root gitdir d rp
+    for root in "${roots[@]}"; do
+        [[ -d "$root" ]] || continue
+        rp=$(realpath "$root" 2>/dev/null) || rp="$root"
+        [[ -n "${seen_root[$rp]:-}" ]] && continue
+        seen_root["$rp"]=1
+        while IFS= read -r gitdir; do
+            d="${gitdir%/.git}"
+            rp=$(realpath "$d" 2>/dev/null) || rp="$d"
+            [[ -n "${seen_dir[$rp]:-}" ]] && continue
+            seen_dir["$rp"]=1
+            cands+=("$rp")
+        done < <(find "$root" -maxdepth 4 -type d -name .git -prune 2>/dev/null)
+    done
+
+    local added=0 k
+    for d in "${cands[@]}"; do
+        k=$(_gh_resolve_key "$d") || continue
+        [[ "$k" == "$target_key" ]] || continue
+        [[ "$d" == "$CLAUDE_BASE/"* ]] && continue   # already auto-discovered
+        if ! { [[ -f "$EXTRA_DIRS_FILE" ]] && grep -qxF "$d" "$EXTRA_DIRS_FILE" 2>/dev/null; }; then
+            printf '%s\n' "$d" >> "$EXTRA_DIRS_FILE"; (( added++ ))
+        fi
+    done
+    if (( added > 0 )); then
+        load_dirs; _apply_groups_to_cache; _apply_demo_mode; apply_filter
+    fi
+    _gh_scan_added=$added
+}
+
+# Pick an existing group or create a new one. Prints the chosen group name on
+# stdout; returns 1 if cancelled. $1 is the header text.
+_choose_group_name() {
+    local header="$1"
+    local -a gs=() labels=()
+    local g
+    while IFS= read -r g; do
+        [[ -n "$g" ]] && { gs+=("$g"); labels+=("$g"); }
+    done < <(_get_all_group_names)
+    gs+=("__NEW__"); labels+=("+ Create new group…")
+
+    local sel=0 n=${#gs[@]}
+    while true; do
+        clear_screen
+        move_to 2 1; tui '  %s%s%s' "${bold}${bwhite}" "$header" "${reset}"
+        local row=4 j
+        for (( j = 0; j < n; j++ )); do
+            move_to "$row" 1
+            if (( j == sel )); then
+                tui '  %s>%s %s %s %s' "${bgreen}${bold}" "${reset}" "${bg_sel}${bold}${bwhite}" "${labels[$j]}" "${reset}"
+            else
+                tui '    %s%s%s' "${bwhite}" "${labels[$j]}" "${reset}"
+            fi
+            (( row++ ))
+        done
+        move_to $(( row + 1 )) 1
+        tui '  %sj/k%s nav  %senter%s select  %sq/esc%s cancel' \
+            "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}"
+        local key; key=$(read_key)
+        case "$key" in
+            $'\e[A' | k) (( sel > 0 )) && (( sel-- )) ;;
+            $'\e[B' | j) (( sel < n - 1 )) && (( sel++ )) ;;
+            q | $'\x1b') return 1 ;;
+            "")
+                if [[ "${gs[$sel]}" == "__NEW__" ]]; then
+                    local nm; nm=$(prompt_input "New group name: ")
+                    [[ -z "$nm" ]] && continue
+                    printf '%s' "$nm"; return 0
+                fi
+                printf '%s' "${gs[$sel]}"; return 0
+                ;;
+        esac
+    done
+}
+
+# Assign every known local clone of repo $1 to a group (chosen or created).
+_gh_group_clones() {
+    local name="$1"
+    local -a paths=()
+    local p
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && paths+=("$p")
+    done < <(_gh_local_paths "$name")
+    if (( ${#paths[@]} == 0 )); then
+        status_msg="No local clones to group yet"; status_color="${byellow}${bold}"; return 1
+    fi
+
+    local grp
+    grp=$(_choose_group_name "Add ${#paths[@]} clone(s) of '$name' to group:") \
+        || { status_msg="Group assignment cancelled"; status_color="$dim"; return 1; }
+    [[ -z "$grp" ]] && { status_msg="Group assignment cancelled"; status_color="$dim"; return 1; }
+
+    local count=0 pth rp idx drp
+    for pth in "${paths[@]}"; do
+        rp=$(realpath "$pth" 2>/dev/null) || rp="$pth"
+        for (( idx = 0; idx < ${#dirs[@]}; idx++ )); do
+            drp=$(realpath "${dirs[$idx]}" 2>/dev/null) || drp="${dirs[$idx]}"
+            if [[ "$drp" == "$rp" ]]; then
+                _set_project_group "$idx" "$grp"; (( count++ )); break
+            fi
+        done
+    done
+    [[ "$group_mode" == "on" ]] && build_group_folders
+    status_msg="Added $count clone(s) to group '$grp'"; status_color="${bgreen}${bold}"
+    return 0
+}
+
+# Path to the repo-list cache file for the current owner (empty owner = "self").
+_gh_cache_file() {
+    local owner="${_gh_owner:-_self}"
+    owner="${owner//\//_}"   # owner can be an org with no slash, but be safe
+    printf '%s/%s' "$GH_REPO_CACHE_DIR" "$owner"
+}
+
+# Parse `gh repo list` template output (on stdin via $1) into the _gh_* arrays.
+_gh_parse_repos() {
+    local out="$1" us=$'\x1f'
     _gh_name=(); _gh_priv=(); _gh_lang=(); _gh_updated=(); _gh_desc=(); _gh_url=()
-    # Fields are separated by the unit-separator byte (0x1f), not a tab: tab is
-    # whitespace, and `read` with a whitespace IFS collapses empty fields, which
-    # would shift columns for repos that have no description or language.
-    local us=$'\x1f' tmpl out
-    tmpl="{{range .}}{{.nameWithOwner}}${us}{{if .isPrivate}}private{{else}}public{{end}}${us}{{if .primaryLanguage}}{{.primaryLanguage.name}}{{end}}${us}{{.updatedAt}}${us}{{if .description}}{{.description}}{{end}}${us}{{.url}}"$'\n'"{{end}}"
-    out=$(gh repo list $_gh_owner --limit 300 \
-        --json nameWithOwner,description,updatedAt,isPrivate,primaryLanguage,url \
-        --template "$tmpl" 2>/dev/null) || return 1
     local n p l u desc url
     while IFS="$us" read -r n p l u desc url; do
         [[ -z "$n" ]] && continue
         _gh_name+=("$n"); _gh_priv+=("$p"); _gh_lang+=("$l")
         _gh_updated+=("${u:0:10}"); _gh_desc+=("$desc"); _gh_url+=("$url")
     done <<< "$out"
-    _gh_loaded=1
-    return 0
+}
+
+# Fetch the repo list into the _gh_* arrays. Served from an on-disk cache when
+# one exists and is younger than $GH_REPO_CACHE_TTL, so re-opening the GitHub
+# screen doesn't hit the network every time. Pass "force" (or press r) to
+# bypass the cache. Returns 1 only when there is no data at all (no cache and
+# the network call failed). Fields use the unit-separator byte (0x1f), not a
+# tab: tab is whitespace, and `read` with a whitespace IFS collapses empty
+# fields, shifting columns for repos with no description or language.
+_gh_fetch_repos() {
+    local force="${1:-}"
+    local cache; cache=$(_gh_cache_file)
+    _gh_from_cache=0; _gh_cache_age=0
+
+    # Serve from a fresh cache unless a refresh was requested.
+    if [[ "$force" != "force" && -f "$cache" ]]; then
+        local mtime now age
+        mtime=$(stat -f '%m' "$cache" 2>/dev/null || echo 0)
+        now=$(date '+%s'); age=$(( now - mtime ))
+        if (( age >= 0 && age < GH_REPO_CACHE_TTL )); then
+            _gh_parse_repos "$(cat "$cache")"
+            _gh_from_cache=1; _gh_cache_age=$age; _gh_loaded=1
+            return 0
+        fi
+    fi
+
+    local us=$'\x1f' tmpl out
+    tmpl="{{range .}}{{.nameWithOwner}}${us}{{if .isPrivate}}private{{else}}public{{end}}${us}{{if .primaryLanguage}}{{.primaryLanguage.name}}{{end}}${us}{{.updatedAt}}${us}{{if .description}}{{.description}}{{end}}${us}{{.url}}"$'\n'"{{end}}"
+    if out=$(gh repo list $_gh_owner --limit 300 \
+            --json nameWithOwner,description,updatedAt,isPrivate,primaryLanguage,url \
+            --template "$tmpl" 2>/dev/null); then
+        mkdir -p "$GH_REPO_CACHE_DIR" 2>/dev/null
+        printf '%s' "$out" > "$cache" 2>/dev/null
+        _gh_parse_repos "$out"
+        _gh_loaded=1
+        return 0
+    fi
+
+    # Network failed — fall back to a stale cache if we have one.
+    if [[ -f "$cache" ]]; then
+        local mtime now
+        mtime=$(stat -f '%m' "$cache" 2>/dev/null || echo 0)
+        now=$(date '+%s')
+        _gh_parse_repos "$(cat "$cache")"
+        _gh_from_cache=1; _gh_cache_age=$(( now - mtime )); _gh_loaded=1
+        return 0
+    fi
+    return 1
+}
+
+# Human-readable age of the current cache, e.g. "3h ago", "2d ago".
+_gh_cache_age_label() {
+    local s="$_gh_cache_age"
+    if (( s < 60 )); then printf 'just now'
+    elif (( s < 3600 )); then printf '%dm ago' "$(( s / 60 ))"
+    elif (( s < 86400 )); then printf '%dh ago' "$(( s / 3600 ))"
+    else printf '%dd ago' "$(( s / 86400 ))"; fi
 }
 
 # Build the visible (filtered) index list — uses do_github's locals (vis, filter).
@@ -4096,21 +4362,37 @@ _gh_do_clone() {
     fi
 }
 
-# Create another clone of the repo at _gh_* index $1. If a local clone already
-# exists, clone from that copy (fast, offline) rather than re-downloading from
-# GitHub; otherwise fall back to `gh repo clone`. Returns 0 on success.
+# Create another clone of the repo at _gh_* index $1. If a local copy already
+# exists, ask whether to clone from that local copy (fast, offline) or fresh
+# from GitHub. With no local copy there is nothing to copy, so it clones from
+# GitHub directly. Returns 0 on success.
 _gh_new_clone() {
     local idx="$1"
     local name="${_gh_name[$idx]}"
     local src; src=$(_gh_local_path "$name")
+
     if [[ -n "$src" && -d "$src/.git" ]]; then
-        local dest
-        dest=$(prompt_input "New clone of '$name' (from local copy, offline) to: " "$(_local_next_clone_dest "$src")")
-        [[ -z "$dest" ]] && { status_msg="Clone cancelled"; status_color="$dim"; return 1; }
-        dest="${dest/#\~/$HOME}"
-        _clone_local_git "$src" "$dest" "$name"
-        return $?
+        local choice
+        choice=$(prompt_input "Clone from (l)ocal copy [fast/offline] or (r)emote GitHub? [l/r]: " "l")
+        case "${choice,,}" in
+            l|local)
+                local dest
+                dest=$(prompt_input "New clone of '$name' (from local copy, offline) to: " "$(_local_next_clone_dest "$src")")
+                [[ -z "$dest" ]] && { status_msg="Clone cancelled"; status_color="$dim"; return 1; }
+                dest="${dest/#\~/$HOME}"
+                _clone_local_git "$src" "$dest" "$name"
+                return $?
+                ;;
+            r|remote|github|gh)
+                _gh_do_clone "$idx" "$(_gh_next_clone_dest "$name")"
+                return $?
+                ;;
+            *)
+                status_msg="Clone cancelled"; status_color="$dim"; return 1
+                ;;
+        esac
     fi
+
     # No local copy yet → clone from GitHub.
     _gh_do_clone "$idx" "$(_gh_next_clone_dest "$name")"
 }
@@ -4226,10 +4508,12 @@ do_github() {
             clear_screen
             move_to 2 1
             local owner_label="${_gh_owner:-@$account}"
-            tui '  %s  G I T H U B  %s  %s%s%s  %s· %d repos%s' \
+            local cache_note=""
+            (( _gh_from_cache )) && cache_note="  ${dim}· cached $(_gh_cache_age_label) (r to refresh)${reset}"
+            tui '  %s  G I T H U B  %s  %s%s%s  %s· %d repos%s%s' \
                 "${bg_bblue}${bold}${white}" "${reset}" \
                 "${bcyan}${bold}" "$owner_label" "${reset}" \
-                "${dim}" "$count" "${reset}"
+                "${dim}" "$count" "${reset}" "$cache_note"
             if [[ -n "$filter" ]]; then
                 move_to 3 1
                 tui '  %sfilter:%s %s%s%s' "${dim}" "${reset}" "${byellow}" "$filter" "${reset}"
@@ -4270,8 +4554,18 @@ do_github() {
                 move_to "$row" 1
                 local ccount; ccount=$(_gh_clone_count "$name")
                 if (( ccount > 1 )); then
-                    tui '      %s* %d clones%s %s%s%s %s(+%d more)%s' "${bgreen}${bold}" "$ccount" "${reset}" \
-                        "${dim}" "${lpath/#$HOME/~}" "${reset}" "${dim}${italic}" "$(( ccount - 1 ))" "${reset}"
+                    # List every clone path (comma-separated), truncated to width.
+                    local all_paths="" cp
+                    while IFS= read -r cp; do
+                        [[ -n "$cp" ]] || continue
+                        [[ -n "$all_paths" ]] && all_paths+=", "
+                        all_paths+="${cp/#$HOME/~}"
+                    done < <(_gh_local_paths "$name")
+                    local pre="* $ccount clones  " avail=$(( term_cols - ${#pre} - 8 ))
+                    (( avail < 10 )) && avail=10
+                    (( ${#all_paths} > avail )) && all_paths="${all_paths:0:$(( avail - 1 ))}…"
+                    tui '      %s* %d clones%s  %s%s%s' "${bgreen}${bold}" "$ccount" "${reset}" \
+                        "${dim}" "$all_paths" "${reset}"
                 elif [[ -n "$lpath" ]]; then
                     tui '      %s* cloned%s %s%s%s' "${bgreen}${bold}" "${reset}" "${dim}" "${lpath/#$HOME/~}" "${reset}"
                 else
@@ -4287,7 +4581,7 @@ do_github() {
             done
 
             move_to "$term_lines" 1
-            tui '  %senter%s open  %sc%s clone  %sC%s +clone  %sa%s assign  %ss%s shell  %sw%s web  %s/%s filter  %sr%s refresh  %so%s owner/org  %sq%s back' \
+            tui '  %senter%s open  %sc%s clone  %sC%s +clone (local/offline)  %sa%s assign  %ss%s shell  %sw%s web  %s/%s filter  %sr%s refresh  %so%s owner/org  %sq%s back' \
                 "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
                 "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
                 "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}${dim}" \
@@ -4315,7 +4609,7 @@ do_github() {
             r)
                 clear_screen; move_to 3 1
                 tui '  %sRefreshing repositories...%s' "${bold}${cyan}" "${reset}"
-                _gh_fetch_repos; _gh_scan_local; _gh_build_vis
+                _gh_fetch_repos force; _gh_scan_local; _gh_build_vis
                 (( sel >= ${#vis[@]} )) && sel=0
                 redraw=true
                 ;;
@@ -4334,34 +4628,41 @@ do_github() {
             "" | s)
                 (( cur < 0 )) && { redraw=true; continue; }
                 local oname="${_gh_name[$cur]}"
+                local _open_as="$key"   # "" = open, s = shell
                 local olpath="" ccount; ccount=$(_gh_clone_count "$oname")
                 if (( ccount == 0 )); then
                     # No local clone yet → clone one.
                     if _gh_do_clone "$cur"; then olpath="$_gh_last_clone_path"; else redraw=true; continue; fi
-                elif (( ccount == 1 )); then
-                    olpath=$(_gh_local_path "$oname")
                 else
-                    # Multiple clones → let the user choose which to open (or make a new one).
-                    local _pick
-                    if _pick=$(_gh_pick_clone "$oname"); then
-                        if [[ "$_pick" == "__NEW__" ]]; then
-                            if _gh_new_clone "$cur"; then
-                                _gh_scan_local; olpath="$_gh_last_clone_path"
-                            else
-                                redraw=true; continue
-                            fi
-                        else
-                            olpath="$_pick"
-                        fi
-                    else
-                        redraw=true; continue
-                    fi
+                    # One or more clones → clones menu (open / new / search disk / group).
+                    # Actions run here (not inside the $(...) subshell that draws the menu)
+                    # so state changes — scanning, grouping — actually stick.
+                    local _pick _note=""
+                    while true; do
+                        _pick=$(_gh_pick_clone "$oname" "$_note") || { _pick=""; break; }
+                        case "$_pick" in
+                            __NEW__)
+                                if _gh_new_clone "$cur"; then _gh_scan_local; olpath="$_gh_last_clone_path"; fi
+                                break
+                                ;;
+                            __SCAN__)
+                                _gh_scan_for_clones "$oname"; _gh_scan_local
+                                _note="Found ${_gh_scan_added} new clone(s) on disk."
+                                ;;
+                            __GROUP__)
+                                _gh_group_clones "$oname"; _gh_scan_local
+                                _note="$status_msg"
+                                ;;
+                            *)  olpath="$_pick"; break ;;
+                        esac
+                    done
+                    [[ -z "$olpath" ]] && { redraw=true; continue; }
                 fi
                 [[ -z "$olpath" ]] && { redraw=true; continue; }
                 open_dir="$olpath"
                 open_title="${oname##*/}"
                 _record_open "$open_dir"
-                if [[ "$key" == "s" ]]; then action="shell"; else action="open"; fi
+                if [[ "$_open_as" == "s" ]]; then action="shell"; else action="open"; fi
                 return
                 ;;
             c) (( cur < 0 )) && { redraw=true; continue; }; _gh_do_clone "$cur"; _gh_scan_local; redraw=true ;;
@@ -4459,7 +4760,7 @@ do_about() {
     (( row += 1 ))
     move_to "$row" 1; tui '    %sg%s      assign group/client         %sG%s  group management' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
-    move_to "$row" 1; tui '    %sb%s      group mode (groups as folders) %s#%s  auto-detect groups' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
+    move_to "$row" 1; tui '    %sb%s      group mode (folders; %sr%s renames) %s#%s  auto-detect groups' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}${dim}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1; tui '    %sS%s      project stats               %s,%s  settings' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
@@ -6112,11 +6413,28 @@ main() {
         local _nav_count=${#filtered[@]}
         $_in_gf && _nav_count=${#group_folders[@]}
 
-        # At the group-folder level `selected` indexes groups, not projects, so
-        # actions that operate on a project would target the wrong one — block them.
+        # At the group-folder level `selected` indexes groups, not projects.
+        # `r` renames the selected group; other project actions are blocked.
         if $_in_gf; then
             case "$key" in
-                r|R|m|e|d|s|A|g|C|'#')
+                r|R)
+                    if (( ${#group_folders[@]} > 0 )); then
+                        local _gold="${group_folders[$selected]}"
+                        if [[ "$_gold" == "__ungrouped__" ]]; then
+                            status_msg="Can't rename the Ungrouped folder"
+                            status_color="${byellow}${bold}"
+                        else
+                            local _gnew; _gnew=$(prompt_input "Rename group: " "$_gold")
+                            if _rename_group "$_gold" "$_gnew"; then
+                                build_group_folders
+                                status_msg="Renamed '$_gold' → '$_gnew'"
+                                status_color="${bgreen}${bold}"
+                            fi
+                        fi
+                    fi
+                    continue
+                    ;;
+                m|e|d|s|A|g|C|'#')
                     status_msg="Open a group folder first (enter)"
                     status_color="${byellow}${bold}"
                     continue
