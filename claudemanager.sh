@@ -29,7 +29,7 @@ GH_REPO_CACHE_DIR="$CLAUDE_BASE/.claudemanager_gh_cache"  # cached `gh repo list
 GH_REPO_CACHE_TTL=$(( 24 * 3600 ))               # serve cached repos for this long before re-hitting the network
 
 # ── Version & auto-update ─────────────────────────────────────────
-CM_VERSION="2.17.0"                         # single source of truth for the version
+CM_VERSION="2.18.0"                         # single source of truth for the version
 UPDATE_STATE_FILE="$CLAUDE_BASE/.claudemanager_update"   # last check epoch + latest known remote version
 CM_REPO_RAW="https://raw.githubusercontent.com/relipse/claudemanager/main"
 CM_REPO_API="https://api.github.com/repos/relipse/claudemanager"  # for the changelog
@@ -2307,9 +2307,16 @@ do_move_dir() {
         return
     fi
 
+    new_name=$(_sanitize_dirname "$new_name")
     local new_path="$parent/$new_name"
     if [[ -e "$new_path" ]]; then
         status_msg="Directory '$new_name' already exists!"
+        status_color="${bred}${bold}"
+        return
+    fi
+
+    if _dir_in_use "$dir"; then
+        status_msg="'$base' is in use (active session/process) — close it first"
         status_color="${bred}${bold}"
         return
     fi
@@ -2350,7 +2357,33 @@ _sanitize_dirname() {
     # Trim leading/trailing whitespace
     name="${name#"${name%%[![:space:]]*}"}"
     name="${name%"${name##*[![:space:]]}"}"
+    # No spaces in folder names: fold whitespace-separated words into camelCase
+    # (keep the first word's case, capitalize the first letter of each word after).
+    if [[ "$name" == *[[:space:]]* ]]; then
+        local out="" word first=1
+        for word in $name; do
+            if (( first )); then
+                out="$word"; first=0
+            else
+                out+="${word^}"
+            fi
+        done
+        name="$out"
+    fi
     printf '%s' "$name"
+}
+
+# Best-effort check: is any process currently working inside this directory?
+# Returns 0 (in use) if a process has its cwd at or below "$dir". Needs lsof;
+# if lsof is unavailable we can't tell, so report "not in use" (return 1).
+_dir_in_use() {
+    local dir="$1"
+    command -v lsof >/dev/null 2>&1 || return 1
+    lsof -nP -d cwd 2>/dev/null | awk -v d="$dir" '
+        NR == 1 { next }
+        { i = index($0, "/"); if (i == 0) next; p = substr($0, i);
+          if (p == d || index(p, d "/") == 1) { found = 1; exit } }
+        END { exit found ? 0 : 1 }'
 }
 
 do_smart_rename() {
@@ -2397,6 +2430,12 @@ do_smart_rename() {
     local new_path="$parent/$new_name"
     if [[ -e "$new_path" ]]; then
         status_msg="Directory '$new_name' already exists!"
+        status_color="${bred}${bold}"
+        return
+    fi
+
+    if _dir_in_use "$dir"; then
+        status_msg="'$base' is in use (active session/process) — close it first"
         status_color="${bred}${bold}"
         return
     fi
@@ -2521,6 +2560,12 @@ do_reorganize() {
         local new_path="$parent/$new_name"
         if [[ -e "$new_path" ]]; then
             status_msg="'$new_name' already exists — skipped"
+            status_color="${byellow}${bold}"
+            (( skipped++ )); continue
+        fi
+
+        if _dir_in_use "$dir"; then
+            status_msg="'$base' is in use (active session/process) — skipped"
             status_color="${byellow}${bold}"
             (( skipped++ )); continue
         fi
