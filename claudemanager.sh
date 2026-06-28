@@ -7,6 +7,7 @@
 #   claudemanager              — open the TUI
 #   claudemanager --install    — install/update the shell wrapper function
 #   claudemanager --refresh    — re-write the shell wrapper (after an update)
+#   claudemanager -n           — create a new project now and open it (like the 'n' key)
 #   claudemanager <query>      — quick-open if match score ≥ threshold, else pre-fill search
 #   claudemanager -o <query>   — force-open the best match (no threshold gate)
 
@@ -28,7 +29,7 @@ GH_REPO_CACHE_DIR="$CLAUDE_BASE/.claudemanager_gh_cache"  # cached `gh repo list
 GH_REPO_CACHE_TTL=$(( 24 * 3600 ))               # serve cached repos for this long before re-hitting the network
 
 # ── Version & auto-update ─────────────────────────────────────────
-CM_VERSION="2.15.0"                         # single source of truth for the version
+CM_VERSION="2.17.0"                         # single source of truth for the version
 UPDATE_STATE_FILE="$CLAUDE_BASE/.claudemanager_update"   # last check epoch + latest known remote version
 CM_REPO_RAW="https://raw.githubusercontent.com/relipse/claudemanager/main"
 CM_REPO_API="https://api.github.com/repos/relipse/claudemanager"  # for the changelog
@@ -2423,6 +2424,128 @@ do_smart_rename() {
     status_color="${bgreen}${bold}"
 }
 
+# Guided bulk cleanup of awkwardly-named (timestamp/hash/tmp) project folders.
+# Walks every such folder one at a time, shows a smart-name suggestion based on
+# the folder's contents, and lets you rename, skip, or quit.
+do_reorganize() {
+    # Collect every real dir index whose basename looks awkward.
+    local -a targets=()
+    local i
+    for (( i=0; i<${#dirs[@]}; i++ )); do
+        _is_awkward_name "${cache_base[$i]}" && targets+=("$i")
+    done
+
+    if (( ${#targets[@]} == 0 )); then
+        status_msg="Nothing to reorganize — no timestamp/awkward folder names found"
+        status_color="${byellow}${bold}"
+        return
+    fi
+
+    local total=${#targets[@]}
+    local renamed=0 skipped=0
+    local pos
+    for pos in "${!targets[@]}"; do
+        local idx="${targets[$pos]}"
+        local dir="${dirs[$idx]}"
+        local base="${cache_base[$idx]}"
+        local title="${cache_title[$idx]}"
+        local source="${cache_source[$idx]}"
+        local parent
+        parent=$(dirname "$dir")
+
+        local suggestion=""
+        [[ "$title" != "$base" ]] && suggestion=$(_sanitize_dirname "$title")
+
+        # ── Draw the wizard screen ──
+        clear_screen
+        local term_lines
+        term_lines=$(tput_lines)
+        local row=2
+        move_to "$row" 1
+        tui '  %sReorganize folders%s  %s(%d of %d)%s' \
+            "${bold}${bcyan}" "${reset}" "${dim}" "$((pos + 1))" "$total" "${reset}"
+        (( row += 2 ))
+        move_to "$row" 1
+        tui '  %sFolder:%s  %s%s%s' "${dim}" "${reset}" "${bwhite}${bold}" "$base" "${reset}"
+        (( row++ ))
+        move_to "$row" 1
+        tui '  %sPath:%s    %s%s%s' "${dim}" "${reset}" "${dim}" "$dir" "${reset}"
+        (( row += 2 ))
+
+        if [[ -n "$suggestion" ]]; then
+            move_to "$row" 1
+            tui '  %sSuggested:%s %s%s%s' "${dim}" "${reset}" "${bgreen}${bold}" "$suggestion" "${reset}"
+            (( row++ ))
+        else
+            move_to "$row" 1
+            tui '  %sNo name detected from contents — type one when renaming.%s' "${dim}" "${reset}"
+            (( row++ ))
+        fi
+
+        # Small preview of the folder's contents for context.
+        (( row++ ))
+        move_to "$row" 1
+        tui '  %sContents:%s' "${dim}" "${reset}"
+        (( row++ ))
+        local entry shown=0
+        while IFS= read -r entry; do
+            [[ -z "$entry" ]] && continue
+            move_to "$row" 1
+            tui '    %s%s%s' "${dim}" "$entry" "${reset}"
+            (( row++ )); (( shown++ ))
+            (( shown >= 6 )) && break
+        done < <(ls -A "$dir" 2>/dev/null)
+        (( shown == 0 )) && { move_to "$row" 1; tui '    %s(empty)%s' "${dim}" "${reset}"; }
+
+        move_to "$term_lines" 1
+        tui '  %senter%s rename  %ss%s skip  %sq%s finish' \
+            "${bwhite}${bold}" "${reset}${dim}" \
+            "${bwhite}${bold}" "${reset}${dim}" \
+            "${bwhite}${bold}" "${reset}"
+
+        local key
+        IFS= read -rsn1 key < /dev/tty
+        case "$key" in
+            q|Q|$'\x1b') break ;;
+            s|S) (( skipped++ )); continue ;;
+        esac
+
+        local default_name="${suggestion:-$base}"
+        local new_name
+        new_name=$(prompt_input "Rename '$base' to (blank = skip): " "$default_name")
+        new_name=$(_sanitize_dirname "$new_name")
+        if [[ -z "$new_name" || "$new_name" == "$base" ]]; then
+            (( skipped++ )); continue
+        fi
+
+        local new_path="$parent/$new_name"
+        if [[ -e "$new_path" ]]; then
+            status_msg="'$new_name' already exists — skipped"
+            status_color="${byellow}${bold}"
+            (( skipped++ )); continue
+        fi
+
+        mv "$dir" "$new_path"
+        if [[ -f "$new_path/.name" ]]; then
+            local stored_name
+            stored_name=$(<"$new_path/.name")
+            [[ "$stored_name" == "$new_name" ]] && rm "$new_path/.name"
+        fi
+        if [[ "$source" == "external" && -f "$EXTRA_DIRS_FILE" ]]; then
+            sed -i '' "s|^${dir}$|${new_path}|" "$EXTRA_DIRS_FILE"
+        fi
+
+        dirs[$idx]="$new_path"
+        cache_fullpath[$idx]="$new_path"
+        refresh_cache "$idx"
+        (( renamed++ ))
+    done
+
+    apply_filter
+    status_msg="Reorganize: $renamed renamed, $skipped skipped of $total"
+    status_color="${bgreen}${bold}"
+}
+
 do_edit_desc() {
     local idx
     idx=$(_get_real_idx) || return
@@ -4750,6 +4873,8 @@ do_about() {
     (( row += 1 ))
     move_to "$row" 1; tui '    %sR%s      smart rename directory      %se%s  edit description' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
+    move_to "$row" 1; tui '    %sO%s      reorganize timestamp folders (guided bulk rename)' "${bwhite}${bold}" "${reset}"
+    (( row += 1 ))
     move_to "$row" 1; tui '    %sC%s      clone project (git-tracked files only)' "${bwhite}${bold}" "${reset}"
     (( row += 1 ))
     move_to "$row" 1; tui '    %sc%s      cycle view (compact/full/grid/groups)  %sp%s  toggle local/all view' "${bwhite}${bold}" "${reset}" "${bwhite}${bold}" "${reset}"
@@ -5637,6 +5762,22 @@ do_settings() {
 
 do_new()   { action="new"; }
 
+# Create a fresh timestamped project dir and write the open signals to the
+# result file. Shared by the in-TUI "new" action and the `claudemanager -n`
+# command-line shortcut.
+_emit_new_result() {
+    local result_file="${CLAUDEMANAGER_RESULT:-}"
+    [[ -n "$result_file" ]] || return 0
+    local new_dir="$CLAUDE_BASE/$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$new_dir"
+    local _new_agent="${open_agent_override:-$agent}"
+    printf '__CLAUDE_CD__:%s\n' "$new_dir" > "$result_file"
+    { [[ "$auto_claude" == "on" ]] || [[ -n "$open_agent_override" ]]; } && printf '__CLAUDE_RUN__\n' >> "$result_file"
+    printf '__AGENT_CMD__:%s\n' "$_new_agent" >> "$result_file"
+    printf '__CLAUDE_TITLE__:%s\n' "$(basename "$new_dir")" >> "$result_file"
+    printf '__CLAUDE_TITLE_MODE__:%s\n' "$title_mode" >> "$result_file"
+}
+
 do_new_with() {
     local -a known_agents=(claude claude-yolo claude-edits opencode copilot amp cursor-agent aider gemini codex)
     local sel=0
@@ -6271,6 +6412,7 @@ main() {
     case "${1:-}" in
         --install) cmd_install; return ;;
         --refresh) cmd_refresh; return ;;
+        -n|--new)  _emit_new_result; return ;;
     esac
 
     # -o <query>: force-open best match (no threshold gate)
@@ -6496,6 +6638,7 @@ main() {
             R)            do_smart_rename ;;
             C)            do_clone_local ;;
             m)            do_move_dir ;;
+            O)            do_reorganize ;;
             e)            do_edit_desc ;;
             d)            do_delete ;;
             s)            do_shell ;;
@@ -6542,14 +6685,7 @@ main() {
                 printf '__CLAUDE_CD__:%s\n' "$open_dir" > "$result_file"
                 ;;
             new)
-                local new_dir="$CLAUDE_BASE/$(date +%Y%m%d_%H%M%S)"
-                mkdir -p "$new_dir"
-                local _new_agent="${open_agent_override:-$agent}"
-                printf '__CLAUDE_CD__:%s\n' "$new_dir" > "$result_file"
-                { [[ "$auto_claude" == "on" ]] || [[ -n "$open_agent_override" ]]; } && printf '__CLAUDE_RUN__\n' >> "$result_file"
-                printf '__AGENT_CMD__:%s\n' "$_new_agent" >> "$result_file"
-                printf '__CLAUDE_TITLE__:%s\n' "$(basename "$new_dir")" >> "$result_file"
-                printf '__CLAUDE_TITLE_MODE__:%s\n' "$title_mode" >> "$result_file"
+                _emit_new_result
                 ;;
             quit) ;;
         esac
